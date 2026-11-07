@@ -39,6 +39,39 @@ describe('between devices', () => {
     expect(laptop.storage.fetchCount).toBe(0);
   });
 
+  it('a change made while a save is going up is saved too, rather than lost', async () => {
+    await phone.stored(makeJpeg({ color: '#aaa' }), 'keep.jpg');
+    await phone.stored(makeJpeg({ color: '#bbb' }), 'gone.jpg');
+    await laptop.catchUp();
+    const id = idOn(phone, 'gone.jpg');
+    await phone.engine.setTrashed([id], true);
+
+    const real = phone.storage.writeState.bind(phone.storage);
+    let letGo!: () => void;
+    const held = new Promise<void>((resolve) => {
+      letGo = resolve;
+    });
+    let started = false;
+    phone.storage.writeState = async (...args) => {
+      started = true;
+      await held;
+      return real(...args);
+    };
+    const saving = phone.engine.sync.flush();
+    await vi.waitFor(() => expect(started).toBe(true));
+    await phone.engine.deleteForever([id]);
+    letGo();
+    await saving;
+    phone.storage.writeState = real;
+
+    expect(phone.engine.sync.hasUnsavedChanges).toBe(true);
+    await phone.engine.sync.flush();
+    expect(phone.engine.sync.hasUnsavedChanges).toBe(false);
+
+    await laptop.catchUp();
+    expect(laptop.engine.store.allPhotos().map((p) => p.filename)).toEqual(['keep.jpg']);
+  });
+
   it('a photo already on the other device is recognised, not stored twice', async () => {
     const bytes = makeJpeg({ color: '#123456' });
     await phone.stored(bytes, 'shot.jpg');

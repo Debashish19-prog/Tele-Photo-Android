@@ -11,6 +11,9 @@
     "dev": "pnpm --filter ./web dev",
     "build": "pnpm --filter ./web build",
     "preview": "pnpm --filter ./web preview",
-    "test": "pnpm --filter ./web test"
+    "test": "pnpm --filter ./web test",
+    "android:keystore": "sh android/scripts/make-keystore.sh",
+    "android:apk": "sh android/scripts/build-apk.sh",
+    "android:demo": "sh android/scripts/build-apk.sh demo"
   }
 }

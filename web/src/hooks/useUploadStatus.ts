@@ -1,6 +1,6 @@
 import { useQuery, useQueryClient } from '@tanstack/react-query';
 import { useEffect, useRef, useSyncExternalStore } from 'react';
-import { api, getEngine } from '@/api';
+import { api, autoBackup, getEngine } from '@/api';
 import type { Engine } from '@/engine/index';
 import { uploader } from '@/lib/uploads';
 
@@ -73,7 +73,8 @@ export function useUploadStatus() {
   // A phone suspends a page when its screen locks, which would stall an upload until it woke again.
   const uploading = sending || (query.data?.stats.pending ?? 0) > 0;
   useEffect(() => {
-    if (!uploading || !navigator.wakeLock) return;
+    // The Android app keeps itself running without the screen, which is the whole point of it.
+    if (!uploading || !navigator.wakeLock || autoBackup.available) return;
     let lock: WakeLockSentinel | null = null;
     let cancelled = false;
     const acquire = () => {

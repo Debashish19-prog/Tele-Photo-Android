@@ -1,10 +1,11 @@
 import { LiquiGlass } from '@liqui-design/glass';
 import { useQuery, useQueryClient } from '@tanstack/react-query';
-import { LogOut, Moon, RefreshCw, Search, ShieldCheck, Sun, SunMoon, Upload, X } from 'lucide-react';
+import { CloudUpload, LogOut, Moon, RefreshCw, Search, ShieldCheck, Sun, SunMoon, Upload, X } from 'lucide-react';
 import { AnimatePresence, motion } from 'motion/react';
 import { useEffect, useRef, useState } from 'react';
 import { Link, Route, Switch, useLocation, useSearch } from 'wouter';
-import { type Account, api } from '@/api';
+import { type Account, api, autoBackup } from '@/api';
+import { AutoBackupBanner, AutoBackupDialog } from '@/components/AutoBackup';
 import { ConfirmDialog, type ConfirmRequest } from '@/components/ConfirmDialog';
 import { CrystalButton, CrystalLink } from '@/components/CrystalButton';
 import { DemoBadge } from '@/components/DemoBadge';
@@ -109,6 +110,7 @@ function UserMenu({ account, onSignedOut }: { account: Account; onSignedOut: () 
   const queryClient = useQueryClient();
   const [confirm, setConfirm] = useState<ConfirmRequest | null>(null);
   const [checking, setChecking] = useState(false);
+  const [backupOpen, setBackupOpen] = useState(false);
   const name = [account.firstName, account.lastName].filter(Boolean).join(' ') || account.username || account.phone;
   const initial = (name.trim()[0] ?? '?').toUpperCase();
 
@@ -144,11 +146,16 @@ function UserMenu({ account, onSignedOut }: { account: Account; onSignedOut: () 
             </MenuRadioGroup>
           </MenuGroup>
           <MenuSeparator />
+          {autoBackup.available ? (
+            <MenuItem onClick={() => setBackupOpen(true)}>
+              <CloudUpload className="size-4" aria-hidden="true" /> Auto backup
+            </MenuItem>
+          ) : null}
           <MenuItem
             onClick={() =>
               void api.rescan().then(
                 () => {
-                  toast.add({ title: 'Checking your Telegram library', description: 'Anything missing from this browser will be restored.' });
+                  toast.add({ title: 'Checking your Telegram library', description: 'Anything missing from this device will be restored.' });
                   void queryClient.invalidateQueries({ queryKey: ['upload-status'] });
                 },
                 (err: Error) => toast.add({ title: 'That did not work', description: err.message, type: 'error' }),
@@ -164,8 +171,10 @@ function UserMenu({ account, onSignedOut }: { account: Account; onSignedOut: () 
             variant="danger"
             onClick={() =>
               setConfirm({
-                title: 'Sign out of this browser?',
-                description: 'This ends its Telegram session and clears its thumbnails and index. Your photos, albums and favorites stay in your Telegram, and come back when you sign in again. Anything still uploading will stop.',
+                title: autoBackup.available ? 'Sign out of this phone?' : 'Sign out of this browser?',
+                description: autoBackup.available
+                  ? 'This ends its Telegram session, turns off auto backup and clears its thumbnails and index. Your photos, albums and favorites stay in your Telegram, and come back when you sign in again. Anything still uploading will stop.'
+                  : 'This ends its Telegram session and clears its thumbnails and index. Your photos, albums and favorites stay in your Telegram, and come back when you sign in again. Anything still uploading will stop.',
                 confirm: 'Sign out',
                 onConfirm: () => api.signOut().then(onSignedOut),
               })
@@ -177,6 +186,7 @@ function UserMenu({ account, onSignedOut }: { account: Account; onSignedOut: () 
       </Menu>
       <ConfirmDialog request={confirm} onClose={() => setConfirm(null)} />
       <StorageCheckDialog open={checking} onClose={() => setChecking(false)} />
+      <AutoBackupDialog open={backupOpen} onClose={() => setBackupOpen(false)} />
     </>
   );
 }
@@ -366,6 +376,7 @@ export function Shell({ account, storage, onReauth }: ShellProps) {
             </Button>
           </div>
         ) : null}
+        <AutoBackupBanner needsSignIn={account.needsReauth} />
         {/*
           Opacity only. A transform here, even briefly, would make this the frame of reference for
           every position: fixed element inside the pages.

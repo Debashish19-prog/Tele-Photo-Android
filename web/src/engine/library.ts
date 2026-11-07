@@ -28,13 +28,15 @@ export interface LibraryDeps {
 export class Library {
   private scan: ScanState = { running: false, scanned: 0, added: 0, error: null };
   private currentScan: Promise<void> | null = null;
+  private failure: unknown = null;
   private purgeTimer: ReturnType<typeof setInterval> | null = null;
 
   constructor(private readonly deps: LibraryDeps) {}
 
   /**
-   * There is no server running at 3 a.m. to do this, so it happens whenever the app is open. A
-   * photo may outstay its 30 days if nobody opens the app, but it is never deleted early.
+   * There is no server running at 3 a.m. to do this, so it happens whenever this code is running:
+   * with the app open, or on Android during a background backup. A photo may outstay its 30 days
+   * if neither happens, but it is never deleted early.
    */
   startPurgeTimer(): void {
     void this.purgeExpired();
@@ -59,7 +61,8 @@ export class Library {
 
     // Checked again now that the await is over: the queue may have picked up a photo meanwhile.
     const fresh = store.getPhotos(removable.map((p) => p.id)).filter((p) => p.status !== 'uploading');
-    sync.recordDeleted(fresh.map((p) => p.sha256));
+    // Saved before the rows go, so nothing can bring these back if the page ends right after.
+    await sync.recordDeleted(fresh.map((p) => p.sha256));
     await store.deletePhotoRows(fresh.map((p) => p.id));
     for (const photo of fresh) queue.detach(photo.id);
     return { deleted: fresh.length, skipped: photos.length - fresh.length };
@@ -82,10 +85,16 @@ export class Library {
     return this.scan;
   }
 
+  /** What stopped the last scan, if anything did, as it was thrown. */
+  get scanFailure(): unknown {
+    return this.failure;
+  }
+
   /** Reads the Telegram channel and adds anything this device does not know about. */
   startScan(options: { full: boolean }): ScanState {
     if (!this.scan.running) {
       this.scan = { running: true, scanned: 0, added: 0, error: null };
+      this.failure = null;
       this.currentScan = this.runScan(this.scan, options.full).finally(() => {
         this.currentScan = null;
       });
@@ -108,6 +117,9 @@ export class Library {
       const ids = await store.insertPhotos(batch);
       state.added += ids.length;
       batch = [];
+      // The channel is read oldest first, so all of it up to here is dealt with. A scan that fails
+      // later carries on from this point, which is what lets a poor connection ever finish one.
+      await store.setMeta('lastScannedMessageId', newest);
     };
 
     try {
@@ -142,11 +154,11 @@ export class Library {
         if (batch.length >= SCAN_BATCH) await flush();
       }
       await flush();
-      await store.setMeta('lastScannedMessageId', newest);
       await sync.apply();
     } catch (err) {
       await flush().catch(() => undefined);
       if (err instanceof SessionRevokedError) this.deps.onRevoked();
+      this.failure = err;
       state.error = err instanceof Error ? err.message : String(err);
     } finally {
       state.running = false;

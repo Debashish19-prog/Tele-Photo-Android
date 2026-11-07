@@ -1,6 +1,6 @@
 import { useQueryClient } from '@tanstack/react-query';
 import { useMemo } from 'react';
-import { api, downloadPhotos } from '@/api';
+import { api, autoBackup, downloadPhotos } from '@/api';
 import { useToast } from '@/components/ui/toast';
 import { formatCount } from '@/lib/format';
 
@@ -83,8 +83,8 @@ export function usePhotoActions() {
         void downloadPhotos(ids).catch(fail);
         toast.add(
           ids.length > 1
-            ? { title: `Preparing ${formatCount(ids.length, 'photo')}`, description: 'They are fetched from Telegram as the zip is built. Keep this tab open.' }
-            : { title: 'Getting the original from Telegram' },
+            ? { title: `Preparing ${formatCount(ids.length, 'photo')}`, description: autoBackup.available ? 'They are fetched from Telegram as the zip is built, and saved to Downloads.' : 'They are fetched from Telegram as the zip is built. Keep this tab open.' }
+            : { title: 'Getting the original from Telegram', ...(autoBackup.available ? { description: 'It will be saved to Downloads.' } : {}) },
         );
       },
     };

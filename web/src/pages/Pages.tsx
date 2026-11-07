@@ -3,7 +3,7 @@ import { ArrowLeft, Check, Images, MoreVertical, Plus, SearchX, Star, Trash2, Up
 import { motion } from 'motion/react';
 import { useState } from 'react';
 import { Link, useLocation, useParams, useSearch } from 'wouter';
-import { api } from '@/api';
+import { api, autoBackup } from '@/api';
 import { useMedia } from '@/hooks/useMedia';
 import { ConfirmDialog, type ConfirmRequest } from '@/components/ConfirmDialog';
 import { EmptyState } from '@/components/EmptyState';
@@ -59,7 +59,7 @@ export function PhotosPage() {
       }
       empty={
         <EmptyState icon={<Images className="size-9" aria-hidden="true" />} title="Your photos will show up here">
-          <p>Drag photos or whole folders anywhere on this page, or choose them from your computer. They go into your own Telegram at full quality.</p>
+          <p>{autoBackup.available ? 'Turn on auto backup, or choose photos to upload. They go into your own Telegram at full quality.' : 'Drag photos or whole folders anywhere on this page, or choose them from your computer. They go into your own Telegram at full quality.'}</p>
           <div className="mt-4 flex justify-center">
             <Button variant="accent" onClick={openFilePicker}>
               <Upload className="size-4" aria-hidden="true" /> Upload photos

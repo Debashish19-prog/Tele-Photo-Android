@@ -1,3 +1,5 @@
+import { androidBridge, androidGallery, androidSettings, onNativeEvent } from '@/engine/android';
+import { AutoSync, type AutoSyncStatus, GalleryLedger } from '@/engine/autosync';
 import { downloadOriginals } from '@/engine/download';
 import { FakeStorage } from '@/engine/fake';
 import { Engine, UserFacingError } from '@/engine/index';
@@ -17,15 +19,34 @@ const hasKeys = Number.isFinite(apiId) && apiId > 0 && apiHash !== '';
 const retention = Number.parseInt(import.meta.env.VITE_TRASH_RETENTION_DAYS ?? '', 10);
 
 let starting: Promise<Engine> | null = null;
+let autoSync: AutoSync | null = null;
+
+/** Only inside the Android app. It keeps going for as long as this page does. */
+async function startAutoSync(engine: Engine): Promise<void> {
+  const bridge = androidBridge();
+  if (!bridge) return;
+  const sync = new AutoSync(engine, androidGallery(bridge), await GalleryLedger.open());
+  autoSync = sync;
+  onNativeEvent('run', () => void sync.run());
+  onNativeEvent('access-changed', () => void sync.run());
+  onNativeEvent('pause', () => sync.pause());
+  document.addEventListener('visibilitychange', () => {
+    if (document.visibilityState === 'visible') void sync.run();
+  });
+  bridge.ready();
+  void sync.run();
+}
 
 async function boot(): Promise<Engine> {
   // GramJS is most of the app's code, and is only needed once this tab is really going to use it.
   const storage = isFake ? new FakeStorage() : new (await import('@/engine/telegram')).TelegramStorage(apiId || 0, apiHash);
-  return Engine.open({
+  const engine = await Engine.open({
     storage,
     configured: isFake || hasKeys,
     trashRetentionDays: Number.isFinite(retention) && retention > 0 ? retention : undefined,
   });
+  await startAutoSync(engine);
+  return engine;
 }
 
 /** One engine for the whole tab, started the first time anything needs it. */
@@ -51,7 +72,11 @@ export const api = {
   sendCode: (phone: string) => withEngine((e) => e.sendCode(phone)),
   submitCode: (loginId: string, code: string) => withEngine((e) => e.submitCode(loginId, code)),
   submitPassword: (loginId: string, password: string) => withEngine((e) => e.submitPassword(loginId, password)),
-  signOut: () => withEngine((e) => e.signOut()),
+  signOut: () =>
+    withEngine(async (e) => {
+      await autoSync?.signOut();
+      await e.signOut();
+    }),
 
   photos: (query: Parameters<Engine['photos']>[0]) => withEngine((e) => e.photos(query)),
   photo: (id: number) => withEngine((e) => e.photo(id)),
@@ -86,3 +111,66 @@ export const api = {
 
 /** Has to be called from the click itself, so that a browser allows the save dialog for a large download. */
 export const downloadPhotos = (ids: number[]) => withEngine((e) => downloadOriginals(e, ids));
+
+export interface AutoBackupState extends AutoSyncStatus {
+  enabled: boolean;
+  mobileData: boolean;
+  batteryExempt: boolean;
+  access: 'all' | 'partial' | 'none';
+  network: 'unmetered' | 'metered' | 'none';
+}
+
+/** Automatic backup of the phone's gallery. Only the Android app has one to back up. */
+export const autoBackup = {
+  available: androidBridge() !== null,
+
+  state: () =>
+    withEngine((): AutoBackupState | null => {
+      const bridge = androidBridge();
+      if (!bridge || !autoSync) return null;
+      return { ...autoSync.status(), ...androidSettings(bridge), access: bridge.access(), network: bridge.network() };
+    }),
+
+  /** Asks Android for whatever is still needed. The app starts by itself once it has it. */
+  turnOn: () =>
+    withEngine(() => {
+      const bridge = androidBridge();
+      if (!bridge) return;
+      bridge.setEnabled(true);
+      if (bridge.access() === 'all') void autoSync?.run();
+      else bridge.requestAccess();
+    }),
+
+  turnOff: () =>
+    withEngine(() => {
+      androidBridge()?.setEnabled(false);
+      autoSync?.pause();
+      return autoSync?.settled().then(() => autoSync?.run());
+    }),
+
+  setMobileData: (allowed: boolean) =>
+    withEngine(() => {
+      androidBridge()?.setMobileData(allowed);
+      void autoSync?.run();
+    }),
+
+  run: () =>
+    withEngine(() => {
+      void autoSync?.run();
+    }),
+
+  retryNow: () =>
+    withEngine(() => {
+      void autoSync?.run({ retryNow: true });
+    }),
+
+  /** Whether a failed upload can be left to automatic backup, rather than asking for the file. */
+  handlesRetries: (): boolean => {
+    const bridge = androidBridge();
+    return bridge !== null && androidSettings(bridge).enabled;
+  },
+
+  requestAccess: () => androidBridge()?.requestAccess(),
+  requestBatteryExemption: () => androidBridge()?.requestBatteryExemption(),
+  openAppSettings: () => androidBridge()?.openAppSettings(),
+};

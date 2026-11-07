@@ -3,7 +3,7 @@ import { useQueryClient } from '@tanstack/react-query';
 import { Check, ChevronDown, CloudUpload, Copy, RotateCw, TriangleAlert, X } from 'lucide-react';
 import { AnimatePresence, motion } from 'motion/react';
 import { useCallback, useMemo, useRef, useState } from 'react';
-import { ApiError, api, type QueueItem, type UploadStatus } from '@/api';
+import { ApiError, api, autoBackup, type QueueItem, type UploadStatus } from '@/api';
 import { Progress, ProgressTrack } from '@/components/ui/progress';
 import { useToast } from '@/components/ui/toast';
 import { useLocalUploads } from '@/hooks/useUploadStatus';
@@ -67,8 +67,11 @@ export function UploadPanel({ status }: { status: UploadStatus | undefined }) {
   const retryQueued = useCallback((items: QueueItem[]) => {
     const ready = items.filter((item) => !item.needsFile);
     if (ready.length > 0) void api.retryUploads(ready.map((item) => item.id)).then(refresh, fail);
+    if (!items.some((item) => item.needsFile)) return;
+    // Auto backup can read the file again by itself, so there is no need to ask for it.
+    if (autoBackup.handlesRetries()) void autoBackup.retryNow().then(refresh, fail);
     // Open from the click itself so browsers allow the file picker, including on phones.
-    if (items.some((item) => item.needsFile)) fileInput.current?.click();
+    else fileInput.current?.click();
   }, [refresh, fail]);
 
   const queued = useMemo(() => new Map((status?.items ?? []).map((item) => [item.id, item])), [status]);
@@ -242,7 +245,7 @@ export function UploadPanel({ status }: { status: UploadStatus | undefined }) {
             </ul>
             {retryable > 1 || needsFiles ? (
               <div className="border-t border-[var(--app-line)] px-4 py-2 text-[11.5px] text-[var(--lq-text-dim)]">
-                {needsFiles ? <p>Select the original photos again to retry. You can select the whole batch; saved photos will be skipped.</p> : null}
+                {needsFiles && !autoBackup.handlesRetries() ? <p>Select the original photos again to retry. You can select the whole batch; saved photos will be skipped.</p> : null}
                 {retryable > 1 ? (
                   <button type="button" className="mt-1 cursor-pointer font-semibold text-[var(--lq-accent)]" onClick={retryAll}>Retry all failed uploads</button>
                 ) : null}
@@ -250,7 +253,7 @@ export function UploadPanel({ status }: { status: UploadStatus | undefined }) {
             ) : null}
             {active > 0 ? (
               <p className="border-t border-[var(--app-line)] px-4 py-2 text-[11.5px] text-[var(--lq-text-dim)]">
-                Keep this tab open until everything has reached Telegram. Your photos go straight there from this device.
+                {autoBackup.available ? 'Your photos go straight to Telegram from this phone.' : 'Keep this tab open until everything has reached Telegram. Your photos go straight there from this device.'}
               </p>
             ) : null}
           </motion.div>

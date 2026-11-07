@@ -101,6 +101,8 @@ export class StateSync {
   private doc: StateDoc = emptyDoc();
   private known: StateVersion | null = null;
   private dirty = false;
+  /** Counts changes, to tell whether one arrived while a save was on its way to Telegram. */
+  private changes = 0;
   private queue: Promise<unknown> = Promise.resolve();
   private timer: ReturnType<typeof setTimeout> | null = null;
   private lastSave = 0;
@@ -131,6 +133,7 @@ export class StateSync {
   }
 
   markDirty(): void {
+    this.changes++;
     if (!this.dirty) {
       this.dirty = true;
       void this.deps.store.setMeta('syncDirty', true);
@@ -146,11 +149,17 @@ export class StateSync {
     }, delay);
   }
 
-  /** Remembers a permanent delete, so other devices drop the photo too and nothing brings it back. */
-  recordDeleted(sha256s: string[]): void {
+  /**
+   * Remembers a permanent delete, so other devices drop the photo too and nothing brings it back.
+   * It is on this device's disk by the time this returns, because the photo's own row is about to
+   * go and the page could end at any moment. Reaching Telegram can then wait for the next save.
+   */
+  async recordDeleted(sha256s: string[]): Promise<void> {
+    if (sha256s.length === 0) return;
     const now = Date.now();
     for (const sha of sha256s) this.doc.photos[sha] = { u: now, d: 1 };
-    if (sha256s.length > 0) this.markDirty();
+    this.markDirty();
+    await this.deps.store.setMeta('syncDoc', this.doc);
   }
 
   isDeleted(sha256: string): boolean {
@@ -256,12 +265,18 @@ export class StateSync {
       const { store, storage, context } = this.deps;
       try {
         await this.pullNow();
+        const changes = this.changes;
         this.known = await storage.writeState(context(), await encodeDoc(this.doc), this.known);
-        this.dirty = false;
         this.lastSave = Date.now();
         await store.setMeta('syncDoc', this.doc);
         await store.setMeta('syncKnown', this.known);
-        await store.setMeta('syncDirty', false);
+        if (this.changes === changes) {
+          this.dirty = false;
+          await store.setMeta('syncDirty', false);
+        } else {
+          // That arrived too late to be in the file just sent, so it still needs saving.
+          this.schedule();
+        }
       } catch (err) {
         if (err instanceof SessionRevokedError) {
           this.deps.onRevoked();

@@ -118,6 +118,8 @@ export interface IngestResult {
   id: number;
   duplicate: boolean;
   restored: boolean;
+  /** Set when an automatic backup left this alone, because the person had already removed it. */
+  skipped?: 'trashed' | 'deleted';
 }
 
 export interface IngestOptions {
@@ -125,6 +127,13 @@ export interface IngestOptions {
   albumId?: number;
   /** Reattaches selected originals without importing new photos or changing their albums. */
   retryOnly?: boolean;
+  /**
+   * The app found this file by itself, rather than the person choosing it. So it must not undo
+   * anything they did: a photo they trashed or deleted stays that way, and albums are left alone.
+   */
+  autoSync?: boolean;
+  /** Stores the file with a placeholder tile, for a photo too large to decode without crashing. */
+  skipPreviews?: boolean;
 }
 
 export interface EngineOptions {
@@ -185,6 +194,8 @@ export class Engine {
   private revision = 0;
   private running = false;
   private catching: Promise<void> = Promise.resolve();
+  /** What stopped the last catch-up, if anything did. */
+  private catchUpFailure: unknown = null;
   private readonly originals = new Map<number, Blob>();
   private readonly originalLoads = new Map<number, Promise<Blob>>();
 
@@ -249,11 +260,32 @@ export class Engine {
     await this.queue.drain();
   }
 
+  /**
+   * Resolves once this device knows what Telegram already holds, without waiting for uploads.
+   * Rejects if it could not find out. An earlier failure is tried again first, as nothing else will.
+   */
+  async whenCaughtUp(): Promise<void> {
+    if (this.catchUpFailure) this.catching = this.catchUp();
+    // Coming back into view can start another one meanwhile, and that one has to finish as well.
+    for (let waited: Promise<void> | null = null; waited !== this.catching; ) {
+      waited = this.catching;
+      await waited;
+    }
+    await this.library.settled();
+    if (this.catchUpFailure) throw this.catchUpFailure;
+  }
+
   /** Brings this device up to date with what other devices have done. */
   private async catchUp(): Promise<void> {
-    await this.sync.pull().catch(() => undefined);
+    this.catchUpFailure = null;
+    let failure: unknown = null;
+    await this.sync.pull().catch((err: unknown) => {
+      failure = err;
+      if (err instanceof SessionRevokedError) void this.store.setNeedsReauth();
+    });
     this.library.startScan({ full: false });
     await this.library.settled();
+    this.catchUpFailure = failure ?? this.library.scanFailure;
     this.queue.notify();
   }
 
@@ -554,10 +586,12 @@ export class Engine {
 
     const sha256 = await hashBlob(file, onProgress);
     const known = store.getPhotoBySha(sha256);
+    const previews = () => (options.skipPreviews ? Promise.resolve(null) : mediaLimiter(() => media.makePreviews(file, type.mime)));
     if (known) {
+      if (options.autoSync && known.trashed_at !== null) return { id: known.id, duplicate: true, restored: false, skipped: 'trashed' };
       // A failed upload is still an upload, even if this tab already holds its file.
       if (known.status !== 'stored' && (!queue.hasFile(known.id) || known.status === 'failed')) {
-        const shown = await mediaLimiter(() => media.makePreviews(file, type.mime));
+        const shown = await previews();
         queue.attach(known.id, file, shown?.telegramThumb ?? null);
         if (known.status === 'failed') await store.retryFailed([known.id], queue.hasFile);
         else await store.rescheduleUpload(known.id, 0, null, false);
@@ -567,16 +601,18 @@ export class Engine {
         queue.notify();
         return { id: known.id, duplicate: false, restored: false };
       }
-      if (options.retryOnly) return { id: known.id, duplicate: known.status === 'stored', restored: false };
+      if (options.retryOnly || options.autoSync) return { id: known.id, duplicate: known.status === 'stored', restored: false };
       return this.placeKnown(known, targetAlbum());
     }
+    if (options.autoSync && this.sync.isDeleted(sha256)) return { id: 0, duplicate: true, restored: false, skipped: 'deleted' };
     if (options.retryOnly) throw new UserFacingError('NOT_AN_UPLOAD', 'This file does not match an existing upload. Select the original photo again.');
 
     const fileDate = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}$/.test(lastModified ?? '') ? lastModified : null;
-    const [meta, shown] = await Promise.all([media.readMetadata(file), mediaLimiter(() => media.makePreviews(file, type.mime))]);
+    const [meta, shown] = await Promise.all([media.readMetadata(file), previews()]);
 
     // The same bytes may have arrived twice at once, in which case the other one has won by now.
     const winner = store.getPhotoBySha(sha256);
+    if (winner && options.autoSync) return { id: winner.id, duplicate: winner.status === 'stored', restored: false };
     if (winner) return this.placeKnown(winner, targetAlbum());
 
     const album = targetAlbum();

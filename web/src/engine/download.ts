@@ -1,4 +1,5 @@
 import { downloadZip } from 'client-zip';
+import { androidBridge, saveThroughApp } from './android';
 import type { Engine } from './index';
 import type { PhotoRow } from './store';
 
@@ -87,5 +88,7 @@ export async function downloadOriginals(engine: Engine, ids: number[]): Promise<
   }
 
   const blob = single ? await engine.original(single.id) : await zipOf(engine, photos).blob();
-  saveBlob(blob, filename);
+  const bridge = androidBridge();
+  if (bridge) await saveThroughApp(bridge, blob, filename);
+  else saveBlob(blob, filename);
 }

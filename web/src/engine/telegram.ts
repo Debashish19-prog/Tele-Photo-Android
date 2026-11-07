@@ -33,6 +33,8 @@ const DOWNLOAD_REQUEST_BYTES = 512 * 1024;
 const UPLOAD_WORKERS = 4;
 const LARGE_FILE_THRESHOLD = 10 * 1024 * 1024;
 const DISCONNECT_SLEEP_MS = 1000;
+/** No answer after this long means none is coming. A request is at most 512 KB, so even a poor connection manages. */
+const STALL_MS = 3 * 60 * 1000;
 const LOGIN_TTL_MS = 10 * 60 * 1000;
 const DELETE_BATCH = 100;
 const DIALOG_SCAN_LIMIT = 1000;
@@ -79,6 +81,14 @@ async function guard<T>(work: () => Promise<T>): Promise<T> {
     return await work();
   } catch (err) {
     throw translate(err);
+  }
+}
+
+/** Telegram has gone quiet. A dropped connection can otherwise leave a request waiting for ever. */
+export class StalledError extends Error {
+  constructor() {
+    super('Telegram stopped responding.');
+    this.name = 'StalledError';
   }
 }
 
@@ -150,6 +160,7 @@ export class TelegramStorage implements StorageBackend {
     private readonly apiId: number,
     private readonly apiHash: string,
     private readonly createClient: ClientFactory = defaultClientFactory,
+    private readonly stallMs = STALL_MS,
   ) {}
 
   // ---- connections ---------------------------------------------------------------------------
@@ -175,6 +186,32 @@ export class TelegramStorage implements StorageBackend {
     const pending = this.clients.get(session);
     this.clients.delete(session);
     if (pending) await pending.then((c) => c.destroy()).catch(() => undefined);
+  }
+
+  /**
+   * Gives up on a request that has gone quiet. Its connection goes too, as that is usually what
+   * failed, and the next request starts a new one.
+   */
+  private async answered<T>(session: string, work: Promise<T>): Promise<T> {
+    const connection = this.clients.get(session);
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const stalled = new Promise<never>((_, reject) => {
+      timer = setTimeout(() => {
+        // Another request may have replaced this connection by now, and the new one is fine.
+        if (this.clients.get(session) === connection) void this.release(session);
+        reject(new StalledError());
+      }, this.stallMs);
+    });
+    try {
+      return await Promise.race([work, stalled]);
+    } finally {
+      clearTimeout(timer);
+    }
+  }
+
+  /** For a request small enough that the whole of it should finish within the limit. */
+  private request<T>(session: string, work: () => Promise<T>): Promise<T> {
+    return guard(() => this.answered(session, work()));
   }
 
   async close(): Promise<void> {
@@ -316,6 +353,7 @@ export class TelegramStorage implements StorageBackend {
    * whole thing into one buffer first, which would run a phone out of memory on a large photo.
    */
   private async uploadBlob(
+    session: string,
     client: TelegramClient,
     file: Blob,
     name: string,
@@ -329,21 +367,29 @@ export class TelegramStorage implements StorageBackend {
 
     let nextPart = 0;
     let sent = 0;
+    /** Set once any part has failed, so the others stop rather than carry on with no purpose. */
+    let abandoned = false;
     onProgress(0);
 
     const sendPart = async (part: number) => {
       const bytes = Buffer.from(await file.slice(part * partSize, (part + 1) * partSize).arrayBuffer());
-      for (;;) {
+      while (!abandoned) {
         // Uploads always go to the account's home data centre, and a reconnect can replace the sender.
-        const sender = await client.getSender(client.session.dcId);
+        const sender = await this.answered(session, client.getSender(client.session.dcId));
         try {
-          await sender.send(
-            isLarge
-              ? new Api.upload.SaveBigFilePart({ fileId, filePart: part, fileTotalParts: partCount, bytes })
-              : new Api.upload.SaveFilePart({ fileId, filePart: part, bytes }),
+          await this.answered(
+            session,
+            Promise.resolve(
+              sender.send(
+                isLarge
+                  ? new Api.upload.SaveBigFilePart({ fileId, filePart: part, fileTotalParts: partCount, bytes })
+                  : new Api.upload.SaveFilePart({ fileId, filePart: part, bytes }),
+              ),
+            ),
           );
           return;
         } catch (err) {
+          if (err instanceof StalledError) throw err;
           if (!sender.isConnected()) {
             await sleep(DISCONNECT_SLEEP_MS);
             continue;
@@ -358,10 +404,16 @@ export class TelegramStorage implements StorageBackend {
     };
 
     const worker = async () => {
-      while (nextPart < partCount) {
-        await sendPart(nextPart++);
-        sent++;
-        onProgress(sent / partCount);
+      try {
+        while (!abandoned && nextPart < partCount) {
+          await sendPart(nextPart++);
+          if (abandoned) return;
+          sent++;
+          onProgress(sent / partCount);
+        }
+      } catch (err) {
+        abandoned = true;
+        throw err;
       }
     };
     await Promise.all(Array.from({ length: Math.min(UPLOAD_WORKERS, partCount) }, worker));
@@ -381,10 +433,10 @@ export class TelegramStorage implements StorageBackend {
    */
   async putPhoto(ctx: StorageContext, input: PutPhotoInput, onProgress: (fraction: number) => void): Promise<{ messageId: number }> {
     return guard(async () => {
-      const client = await this.client(ctx.session);
+      const client = await this.answered(ctx.session, this.client(ctx.session));
       const peer = this.peer(ctx.library);
-      const file = await this.uploadBlob(client, input.file, input.filename, onProgress);
-      const thumb = input.thumb ? await this.uploadBlob(client, input.thumb, 'thumb.jpg') : undefined;
+      const file = await this.uploadBlob(ctx.session, client, input.file, input.filename, onProgress);
+      const thumb = input.thumb ? await this.uploadBlob(ctx.session, client, input.thumb, 'thumb.jpg') : undefined;
 
       const send = async (withThumb: Api.InputFile | Api.InputFileBig | undefined) => {
         const randomId = readBigIntFromBuffer(generateRandomBytes(8), true, true);
@@ -408,21 +460,19 @@ export class TelegramStorage implements StorageBackend {
 
       let message: Api.Message;
       try {
-        message = await send(thumb);
+        message = await this.answered(ctx.session, send(thumb));
       } catch (err) {
         // The photo matters and its thumbnail does not, so a refused thumbnail must not lose the upload.
         const code = rpcCode(err);
         if (!thumb || !code?.includes('THUMB')) throw err;
-        message = await send(undefined);
+        message = await this.answered(ctx.session, send(undefined));
       }
 
       const media = message.media;
       const intact = isDocumentMedia(media) && media.document.size.toString() === String(input.size);
       if (!intact) {
         // Never accept a copy that differs from what we sent. The original is still on disk, so this retries safely.
-        await client
-          .invoke(new Api.channels.DeleteMessages({ channel: this.inputChannel(ctx.library), id: [message.id] }))
-          .catch(() => undefined);
+        await this.answered(ctx.session, client.invoke(new Api.channels.DeleteMessages({ channel: this.inputChannel(ctx.library), id: [message.id] }))).catch(() => undefined);
         throw new Error('Telegram did not store this file as an unmodified document');
       }
       this.mediaCache.set(message.id, media);
@@ -539,9 +589,13 @@ export class TelegramStorage implements StorageBackend {
   }
 
   async *scanLibrary(ctx: StorageContext, options: { afterMessageId?: number } = {}): AsyncIterable<ScannedPhoto> {
-    const client = await guard(() => this.client(ctx.session));
+    const client = await this.request(ctx.session, () => this.client(ctx.session));
     try {
-      for await (const message of client.iterMessages(this.peer(ctx.library), { reverse: true, minId: options.afterMessageId ?? 0 })) {
+      const messages = client.iterMessages(this.peer(ctx.library), { reverse: true, minId: options.afterMessageId ?? 0 })[Symbol.asyncIterator]();
+      for (;;) {
+        // Each step is timed by itself, as reading a large library can rightly take a long while.
+        const { value: message, done } = await this.answered(ctx.session, messages.next());
+        if (done) return;
         const media = message.media;
         if (!isDocumentMedia(media)) continue;
         // Saves asking for it again when this photo's thumbnail is wanted moments later.
@@ -582,7 +636,7 @@ export class TelegramStorage implements StorageBackend {
   }
 
   async readState(ctx: StorageContext, known: StateVersion | null) {
-    return guard(async (): Promise<{ changed: false } | { changed: true; file: StateFile | null }> => {
+    return this.request(ctx.session, async (): Promise<{ changed: false } | { changed: true; file: StateFile | null }> => {
       const client = await this.client(ctx.session);
       const message = await this.findStateMessage(client, ctx);
       if (!message) return { changed: true, file: null };
@@ -598,11 +652,11 @@ export class TelegramStorage implements StorageBackend {
    * up with old copies. A new message and pin are only used when that cannot be done.
    */
   async writeState(ctx: StorageContext, bytes: Uint8Array, known: StateVersion | null): Promise<StateVersion> {
-    return guard(async () => {
+    return this.request(ctx.session, async () => {
       const client = await this.client(ctx.session);
       const peer = this.peer(ctx.library);
       const name = 'tele-photo-state.json.gz';
-      const file = await this.uploadBlob(client, new Blob([bytes as BlobPart]), name);
+      const file = await this.uploadBlob(ctx.session, client, new Blob([bytes as BlobPart]), name);
       const media = () =>
         new Api.InputMediaUploadedDocument({
           file,

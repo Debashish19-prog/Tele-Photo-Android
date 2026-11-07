@@ -41,6 +41,48 @@ pnpm dev
 
 Then open <http://localhost:5173>. It has to be `localhost` or HTTPS, because browsers only offer the cryptography it needs on secure pages. That means opening it from your phone by its network address will not work, while a deployed site will.
 
+## The Android app
+
+`android/` builds an APK of the same app, which can also back up the phone's gallery by itself. There is still no server: the phone talks straight to Telegram.
+
+**It has not been tried on a phone yet.** The backup logic has automated tests, and it has run in Chrome against a simulated phone, but the Android side has only been compiled and linted. Start with the demo build, then try your real account with a few photos, and run **Check Telegram storage** from the account menu before relying on it.
+
+### Build it
+
+You need [Android Studio](https://developer.android.com/studio) for its SDK and Java, plus Node 22 or newer and pnpm.
+
+```bash
+pnpm install
+cp .env.example .env     # then fill in VITE_TELEGRAM_API_ID and VITE_TELEGRAM_API_HASH
+pnpm android:apk         # android/dist/Tele-Photo.apk
+pnpm android:demo        # android/dist/Tele-Photo-demo.apk, with pretend Telegram, for testing
+```
+
+If Android Studio is not in `~/Applications/android-studio`, or the SDK is not in `~/Android/Sdk`, set `JAVA_HOME` and `ANDROID_HOME` first.
+
+The first `android:apk` makes a signing key in `android/keystore.jks`, with its password in `android/keystore.properties`. **Keep a copy of both somewhere safe.** Neither is committed. Android only installs an update signed with the same key, so without them you would have to uninstall the app, and sign in again, to update it.
+
+To work on it in Android Studio, open the `android` folder. Run `pnpm build` first, because the app serves whatever website is in `web/dist`.
+
+Your API key is inside the APK and can be read out of it, as with the website, so only share an APK with people you would share the key with.
+
+### Install it
+
+Copy the APK to the phone and open it, allowing the install when Android asks, or run `adb install android/dist/Tele-Photo.apk` with the phone connected over USB. Google is phasing in developer verification for apps installed outside the Play Store, which can add a one-time wait to the first method in some countries. `adb` is not affected.
+
+### How auto backup works
+
+Turn it on from the banner in Photos, or from the account menu under **Auto backup**, and choose **Allow all** when Android asks about photos.
+
+- **Originals only.** The app reads each file's exact bytes and sends them the same way as any other upload, so nothing is recompressed. Without the extra permission, Android would remove the location from photos before the app sees them. If that permission is missing, the app stops and asks for it, rather than back up a changed copy.
+- **It only ever copies.** Removing a photo from the phone does not remove its backup. A photo you trash or delete in the app is not uploaded again. Nothing on the phone is ever changed or deleted.
+- **Wi-Fi only by default.** Originals are large, so mobile data is off unless you turn it on. If Wi-Fi drops partway through a photo, that one photo may finish over mobile data.
+- **In the background.** A new photo wakes the app, which shows a notification while it works and closes again afterwards. Allow **Run in the background** when asked. Without it, Android may stop the backup after about ten minutes each time, and it carries on the next time Android allows it. Some phone makers limit background apps further, and may need the app exempted from battery saving.
+- **It picks up where it left off.** If anything stops it, the next run starts from the first photo not yet stored. Photos already in Telegram are recognised by their hash, so reinstalling the app reads them again but does not upload them again.
+- **Files it cannot store** are counted under **Auto backup**, such as a file that only has the name of a photo.
+- **Videos are not backed up yet.**
+- **Force stop.** Android cancels everything for an app that is force-stopped, and some phones treat swiping an app away the same way. Backups then wait until you next open the app.
+
 ## Can other people use it?
 
 Yes. Everyone opens the same link and signs in with their own number. Each person's library lives in their own Telegram and their own browser, so people cannot see each other's photos, and more users cost you nothing in storage or bandwidth.

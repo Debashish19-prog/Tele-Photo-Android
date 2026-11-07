@@ -8,7 +8,7 @@ import { AnimatePresence, type DragControls, motion, useDragControls, useIsPrese
 import { type ReactNode, type RefObject, useCallback, useEffect, useLayoutEffect, useRef, useState } from 'react';
 import { createPortal } from 'react-dom';
 import { Link } from 'wouter';
-import { api, type PhotoDetail, type PhotoItem } from '@/api';
+import { api, type PhotoDetail, type PhotoItem, autoBackup } from '@/api';
 import { Tip } from '@/components/IconAction';
 import { Toolbar, ToolbarButton, ToolbarGroup } from '@/components/ui/toolbar';
 import { preloadPreview, useMedia } from '@/hooks/useMedia';
@@ -525,7 +525,7 @@ function storageFact(photo: PhotoDetail) {
   if (photo.status === 'failed') {
     return <Fact icon={<TriangleAlert className="size-5 text-[#ff8a8f]" aria-hidden="true" />} title="Not in Telegram yet" lines={[photo.error, 'Your original is still on your device. Retry from the uploads panel, or add the file again.']} />;
   }
-  return <Fact icon={<CloudUpload className="size-5" aria-hidden="true" />} title="Being saved to Telegram" lines={['Keep this tab open until Telegram confirms it.']} />;
+  return <Fact icon={<CloudUpload className="size-5" aria-hidden="true" />} title="Being saved to Telegram" lines={[autoBackup.available ? 'This finishes by itself, even with the app closed.' : 'Keep this tab open until Telegram confirms it.']} />;
 }
 
 function InfoPanel({ photo, sideways, onClose }: { photo: PhotoDetail | undefined; sideways: boolean; onClose: () => void }) {

@@ -12,7 +12,7 @@ import { CustomFile } from 'telegram/client/uploads.js';
 import { StringSession } from 'telegram/sessions/index.js';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import { MAX_PHOTO_BYTES } from '../src/engine/index';
-import { TelegramStorage } from '../src/engine/telegram';
+import { StalledError, TelegramStorage } from '../src/engine/telegram';
 import { OriginalMissingError, RateLimitedError, SessionRevokedError, UserFacingError } from '../src/engine/types';
 
 const ctx = { session: '', library: { channelId: '777', accessHash: '888' } };
@@ -348,6 +348,123 @@ describe('TelegramStorage against real GramJS', () => {
   it('deletes in batches of 100, which is what channels.deleteMessages allows', async () => {
     await h.storage.deletePhotos(ctx, Array.from({ length: 250 }, (_, i) => i + 1));
     expect(h.deleted.map((d) => d.id.length)).toEqual([100, 100, 50]);
+  });
+
+  describe('when a connection goes quiet', () => {
+    const never = () => new Promise<never>(() => undefined);
+    const wait = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
+    const sender = (send: () => Promise<unknown>) => (async () => ({ dcId: 2, isConnected: () => true, send })) as unknown as TelegramClient['getSender'];
+
+    /** Connections behave as `hang` says until `heal` is called. The ones made after that work. */
+    function connections(hang: (client: TelegramClient) => void, stallMs = 30) {
+      const clients: TelegramClient[] = [];
+      const destroyed: TelegramClient[] = [];
+      let broken = true;
+      const storage = new TelegramStorage(1, 'hash', () => {
+        const client = h.factory();
+        if (broken) hang(client);
+        client.destroy = async () => void destroyed.push(client);
+        clients.push(client);
+        return client;
+      }, stallMs);
+      return { storage, clients, destroyed, heal: () => { broken = false; } };
+    }
+
+    const photo = (bytes: Buffer) => ({ file: new Blob([bytes as BlobPart]), thumb: null, filename: 'a.jpg', mime: 'image/jpeg', size: bytes.length, caption: 'cap' });
+
+    const reading = (storage: TelegramStorage) => async () => {
+      let count = 0;
+      for await (const _ of storage.scanLibrary(ctx)) count++;
+      return count;
+    };
+
+    it('gives up on an upload part with no answer, then starts again on a new connection', async () => {
+      const { storage, clients, destroyed, heal } = connections((client) => {
+        client.getSender = sender(never);
+      });
+      const bytes = randomBytes(1024);
+
+      await expect(storage.putPhoto(ctx, photo(bytes), () => {})).rejects.toBeInstanceOf(StalledError);
+      await wait(0);
+      expect(destroyed).toEqual([clients[0]]);
+
+      heal();
+      await expect(storage.putPhoto(ctx, photo(bytes), () => {})).resolves.toEqual({ messageId: 42 });
+      expect(clients).toHaveLength(2);
+      expect(h.reassembled().equals(bytes)).toBe(true);
+    });
+
+    it('gives up on a message that is never confirmed', async () => {
+      const { storage } = connections((client) => {
+        client.invoke = never as unknown as TelegramClient['invoke'];
+      });
+      await expect(storage.putPhoto(ctx, photo(randomBytes(1024)), () => {})).rejects.toBeInstanceOf(StalledError);
+    });
+
+    it('does not mistake a long upload for a stuck one, as long as each part gets an answer', async () => {
+      const { storage } = connections((client) => {
+        client.getSender = sender(async () => {
+          await wait(60);
+          return true;
+        });
+      }, 150);
+      // Four rounds of parts at 60 ms each comes to well over the limit in total.
+      const bytes = randomBytes(2 * 1024 * 1024);
+      h.reply = (req) => documentReply(req, bytes.length);
+
+      await expect(storage.putPhoto(ctx, photo(bytes), () => {})).resolves.toEqual({ messageId: 42 });
+    });
+
+    it('gives up on a scan with no answer, and the next scan uses a new connection', async () => {
+      const { storage, clients } = connections((client) => {
+        client.iterMessages = (() => ({ [Symbol.asyncIterator]: () => ({ next: never }) })) as unknown as TelegramClient['iterMessages'];
+      });
+      const scan = reading(storage);
+
+      await expect(scan()).rejects.toBeInstanceOf(StalledError);
+      await expect(scan()).rejects.toBeInstanceOf(StalledError);
+      expect(clients).toHaveLength(2);
+    });
+
+    it('does not mistake a long scan for a stuck one, as long as each step gets an answer', async () => {
+      const { storage } = connections((client) => {
+        let left = 8;
+        const next = async () => {
+          await wait(50);
+          return left-- > 0 ? { value: { media: null }, done: false } : { value: undefined, done: true };
+        };
+        client.iterMessages = (() => ({ [Symbol.asyncIterator]: () => ({ next }) })) as unknown as TelegramClient['iterMessages'];
+      }, 200);
+
+      await expect(reading(storage)()).resolves.toBe(0);
+    });
+
+    it('reads through real GramJS message paging one step at a time, oldest first', async () => {
+      const message = (id: number) => Object.assign(storedMessage(10), { id });
+      const storage = new TelegramStorage(1, 'hash', () => {
+        const client = h.factory();
+        client.invoke = (async (req: unknown) => {
+          if (req instanceof Api.messages.GetHistory) {
+            return new Api.messages.ChannelMessages({ pts: 1, count: 3, messages: [message(3), message(2), message(1)], topics: [], chats: [], users: [] });
+          }
+          throw new Error(`Unexpected request: ${(req as { className?: string }).className}`);
+        }) as TelegramClient['invoke'];
+        return client;
+      });
+
+      const ids: number[] = [];
+      for await (const item of storage.scanLibrary(ctx)) ids.push(item.messageId);
+
+      expect(ids).toEqual([1, 2, 3]);
+    });
+
+    it('gives up on reading or saving the synced state with no answer', async () => {
+      const hung = () => connections((client) => {
+        client.invoke = never as unknown as TelegramClient['invoke'];
+      }).storage;
+      await expect(hung().readState(ctx, null)).rejects.toBeInstanceOf(StalledError);
+      await expect(hung().writeState(ctx, new Uint8Array([1, 2, 3]), null)).rejects.toBeInstanceOf(StalledError);
+    });
   });
 
   describe('signing in', () => {

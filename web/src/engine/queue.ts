@@ -11,8 +11,14 @@ export const PREVIEW_DOWNLOAD_LIMIT = 50 * 1024 * 1024;
 /** Held on to in pieces, as a Blob can spill to disk while plain arrays have to fit in memory. */
 const COLLECT_ROLLUP_BYTES = 32 * 1024 * 1024;
 
-export const INTERRUPTED_MESSAGE = 'The tab closed before this reached Telegram. Add the file again to finish.';
-export const NO_FILE_MESSAGE = 'This browser no longer has the file. Add it again to finish.';
+const inAndroidApp = 'TelePhotoAndroid' in globalThis;
+
+export const INTERRUPTED_MESSAGE = inAndroidApp
+  ? 'The app closed before this reached Telegram. Auto backup finishes it if it is in your gallery. Otherwise, add the file again.'
+  : 'The tab closed before this reached Telegram. Add the file again to finish.';
+export const NO_FILE_MESSAGE = inAndroidApp
+  ? 'The app no longer has this file. Auto backup finishes it if it is in your gallery. Otherwise, add the file again.'
+  : 'This browser no longer has the file. Add it again to finish.';
 
 /** Gathers a download into one Blob, without keeping all of it in plain memory on the way. */
 export async function collectBlob(stream: AsyncIterable<Uint8Array>, type: string): Promise<Blob> {
@@ -55,8 +61,20 @@ export class UploadQueue {
   private stopped = true;
   private previewRunning = false;
   private readonly running = new Set<Promise<void>>();
+  private changed: Promise<void> | null = null;
+  private signalChanged: (() => void) | null = null;
 
   constructor(private readonly deps: QueueDeps) {}
+
+  /**
+   * Resolves when a job next ends. A phone slows timers right down on a page nobody can see, but
+   * not the network, so waiting on this keeps a backup at full speed with the screen off.
+   */
+  whenChanged(): Promise<void> {
+    return (this.changed ??= new Promise((resolve) => {
+      this.signalChanged = resolve;
+    }));
+  }
 
   attach(id: number, file: Blob, thumb: Blob | null): void {
     this.files.set(id, { file, thumb });
@@ -125,6 +143,9 @@ export class UploadQueue {
       .finally(() => {
         this.running.delete(task);
         this.notify();
+        this.signalChanged?.();
+        this.changed = null;
+        this.signalChanged = null;
       });
   }
 
