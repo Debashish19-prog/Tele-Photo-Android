@@ -1,5 +1,6 @@
 import { buildCaption } from './caption';
 import { mediaLimiter, type MediaTools } from './media';
+import { joinPieces, PIECE_MIME, pieceName, piecesOf, planPieces, type SplitPolicy, type StoredPiece } from './pieces';
 import type { PhotoRow, Store } from './store';
 import { RateLimitedError, SessionRevokedError, type StorageBackend, type StorageContext } from './types';
 
@@ -43,6 +44,7 @@ export interface QueueDeps {
   media: MediaTools;
   context: () => StorageContext;
   onRevoked: () => void;
+  split: SplitPolicy;
 }
 
 /**
@@ -159,20 +161,29 @@ export class UploadQueue {
         return;
       }
       await store.markUploading(job.id);
-      const { messageId } = await storage.putPhoto(
-        this.deps.context(),
-        {
-          file: held.file,
-          thumb: held.thumb,
-          filename: job.filename,
-          mime: job.mime,
-          size: job.size,
-          caption: buildCaption({
-            filename: job.filename, sha256: job.sha256, takenAt: job.taken_at, width: job.width, height: job.height,
-          }),
-        },
-        (fraction) => this.progress.set(job.id, fraction),
-      );
+      const plan = planPieces(job.size, this.deps.split);
+      let messageId: number;
+      if (plan.length > 1) {
+        const first = await this.sendPieces(job, held, plan);
+        // Stopped partway. What was sent is saved, so adding the file again carries on from there.
+        if (first === null) return;
+        messageId = first;
+      } else {
+        ({ messageId } = await storage.putPhoto(
+          this.deps.context(),
+          {
+            file: held.file,
+            thumb: held.thumb,
+            filename: job.filename,
+            mime: job.mime,
+            size: job.size,
+            caption: buildCaption({
+              filename: job.filename, sha256: job.sha256, takenAt: job.taken_at, width: job.width, height: job.height,
+            }),
+          },
+          (fraction) => this.progress.set(job.id, fraction),
+        ));
+      }
       // Saved first, let go of second. A failure in between leaves a spare reference, never a lost photo.
       await store.markStored(job.id, messageId);
       this.files.delete(job.id);
@@ -182,6 +193,38 @@ export class UploadQueue {
       this.progress.delete(job.id);
       this.busy = false;
     }
+  }
+
+  /**
+   * Sends what is left of a large file, one message per piece. Each is saved as soon as Telegram
+   * confirms it, so a failure, or even a closed tab, only ever costs the piece in progress.
+   */
+  private async sendPieces(job: PhotoRow, held: { file: Blob; thumb: Blob | null }, plan: { start: number; end: number }[]): Promise<number | null> {
+    const { store, storage } = this.deps;
+    const sent: StoredPiece[] = [...(job.tg_parts ?? [])];
+    for (let i = sent.length; i < plan.length; i++) {
+      if (this.stopped) return null;
+      const { start, end } = plan[i]!;
+      const { messageId } = await storage.putPhoto(
+        this.deps.context(),
+        {
+          file: held.file.slice(start, end),
+          // Only the first needs one. It stands for the whole video, and is the piece a new device asks.
+          thumb: i === 0 ? held.thumb : null,
+          filename: pieceName(job.filename, i),
+          mime: PIECE_MIME,
+          size: end - start,
+          caption: buildCaption({
+            filename: job.filename, sha256: job.sha256, takenAt: job.taken_at, width: job.width, height: job.height,
+            part: { index: i + 1, count: plan.length, totalSize: job.size, mime: job.mime },
+          }),
+        },
+        (fraction) => this.progress.set(job.id, (start + fraction * (end - start)) / job.size),
+      );
+      sent.push({ messageId, size: end - start });
+      await store.savePieces(job.id, [...sent]);
+    }
+    return sent[0]!.messageId;
   }
 
   private async handleUploadError(job: PhotoRow, err: unknown): Promise<void> {
@@ -213,10 +256,9 @@ export class UploadQueue {
         await store.markPreviewResult(job.id, 'unavailable');
         return;
       }
-      const { stream } = await storage.getPhoto(this.deps.context(), job.tg_message_id);
-      const original = await collectBlob(stream, job.mime);
+      const original = await collectBlob(joinPieces(storage, this.deps.context(), piecesOf(job)), job.mime);
       const shown = await mediaLimiter(() => media.makePreviews(original, job.mime));
-      const meta = await media.readMetadata(original);
+      const meta = await media.readMetadata(original, job.mime);
       if (shown) {
         await store.cacheThumb(job.sha256, shown.thumb);
         await store.cachePreview(job.sha256, shown.preview);

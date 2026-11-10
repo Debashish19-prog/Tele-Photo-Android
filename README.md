@@ -2,7 +2,7 @@
 
 A Google Photos alternative that keeps your originals in your own Telegram account, at full quality.
 
-You sign in with your Telegram phone number. Tele-Photo creates a private channel on your account called **Tele-Photo Library** and stores each photo there as one untouched file. A timeline, albums, favorites, search and a trash all run on top of it, in a liquid glass interface.
+You sign in with your Telegram phone number. Tele-Photo creates a private channel on your account called **Tele-Photo Library** and stores each photo and video there as untouched files. A timeline, albums, favorites, search and a trash all run on top of it, in a liquid glass interface.
 
 It runs entirely in your browser. There is no server and no database, so it can be hosted for free on any static host, and any number of people can use the same site without sharing anything.
 
@@ -147,15 +147,32 @@ The original stays on your device throughout, so nothing can be lost. Rate limit
 
 **Uploads only run while the tab is open**, as there is no server to finish them. The page warns you before you leave, and asks a phone not to sleep while uploading. If a tab closes anyway, **Retry** asks you to select the originals again. You can select the whole batch: finished ones are skipped, and the rest pick up from there, keeping their albums.
 
+### Videos
+
+Videos are stored the same way as photos: as documents, with their bytes untouched and their SHA-256 recorded.
+
+Telegram takes at most 1.95 GB per file, so a larger video goes up in pieces of 1 GiB. Each piece is its own message, named `clip.mp4.001`, `clip.mp4.002` and so on, with a caption saying which part it is and what the whole file is. This all happens in your browser, with nothing passing through the host.
+
+- **Interrupted uploads** only lose the piece in progress. Add the same file again and it carries on from the next one.
+- **Other devices** rebuild the video from the channel, and only show it once every piece has arrived.
+- **Downloading** joins the pieces and checks the result against the original's SHA-256. If it does not match, the download fails rather than leaving a damaged file.
+- **Watching** does not need the whole video. A small service worker (`web/public/media-sw.js`) answers the player's requests by fetching just the bytes it asks for, so a video can start and seek straight away, wherever in the pieces that falls.
+- **Deleting** removes every piece.
+
+The pieces do not play on their own in Telegram, because only the first has the start of the video. If you ever need the video without this app, download all its pieces and join them with `cat clip.mp4.* > clip.mp4`.
+
+Whether a video plays in the app depends on your browser: H.264 MP4 and WebM play almost everywhere, HEVC depends on the device, and MKV and AVI often do not. Anything that will not play is still stored, and can still be downloaded.
+
 ## Good to know
 
-- **Size limit:** 2,097,152,000 bytes per photo (about 1.95 GB). This is Telegram's real ceiling for non-Premium accounts: 4000 parts of 512 KB. Larger files are refused up front.
-- **Formats:** anything that is recognisably an image, by its contents rather than its name. Thumbnails depend on what your browser can read: JPEG, PNG, WebP, GIF and AVIF everywhere, and HEIC through a built-in decoder. Camera RAW uses its embedded preview when it has one. TIFF only gets a thumbnail in Safari. If no preview can be made, the photo is still stored and gets a placeholder tile.
+- **Size limit:** 2,097,152,000 bytes per photo (about 1.95 GB), which is Telegram's real ceiling for non-Premium accounts: 4000 parts of 512 KB. Larger photos are refused up front. Videos have no limit, as larger ones are split.
+- **Formats:** anything that is recognisably an image or a video, by its contents rather than its name. Thumbnails depend on what your browser can read: JPEG, PNG, WebP, GIF and AVIF everywhere, and HEIC through a built-in decoder. Camera RAW uses its embedded preview when it has one. TIFF only gets a thumbnail in Safari. If no preview can be made, the file is still stored and gets a placeholder tile. A video's thumbnail is a frame from it, so it depends on the browser being able to play it.
 - **Privacy:** only your account can see the channel, but channels are not end-to-end encrypted, so Telegram itself could read them.
 - **Your Telegram account:** this uses the official API, signing in like any third-party client. Telegram does not promise it as a storage service, and it can rate-limit or restrict accounts it considers abusive. Bulk uploads are paced to respect its limits, but keep other copies of anything irreplaceable.
 - **Deleting:** Trash keeps photos for 30 days (`VITE_TRASH_RETENTION_DAYS`), then deletes them from Telegram for good. With no server to do this on schedule, it happens the next time the app is open after that, so never early. Deleting the channel from inside Telegram deletes your originals, and the app cannot get them back.
 - **One tab at a time:** the app runs in a single tab, and a second one offers to take over.
 - **Signing out** ends that browser's Telegram session and clears its local data. Everything else stays safe in Telegram.
+- **Large videos:** a 6 GB video takes about 40 minutes to upload at 20 Mbit/s, and the tab has to stay open throughout.
 - **Glass effect:** true refraction appears in Chromium browsers. Safari and Firefox automatically show frosted glass instead.
 
 ## Screenshots
@@ -228,7 +245,7 @@ pnpm dev              # the web app with hot reload, on :5173
 pnpm test             # the test suite
 ```
 
-To try the app without a Telegram account, set `VITE_STORAGE=fake` in `.env`. Any phone number works with code `12345` (a number ending in 2 also asks for the password `hunter2`). Photos stay in the browser, and a yellow banner says so.
+To try the app without a Telegram account, set `VITE_STORAGE=fake` in `.env`. Any phone number works with code `12345` (a number ending in 2 also asks for the password `hunter2`). Photos stay in the browser, and a yellow banner says so. To try splitting without gigabytes of video, also set `VITE_FAKE_PIECE_BYTES`, which only affects this mode.
 
 | Path | What it does |
 | --- | --- |
@@ -240,6 +257,8 @@ To try the app without a Telegram account, set `VITE_STORAGE=fake` in `.env`. An
 | `web/src/engine/sync.ts` | Albums and favorites between devices |
 | `web/src/engine/media.ts` | File checks, EXIF, thumbnails |
 | `web/src/engine/caption.ts` | What each Telegram message's caption holds |
+| `web/src/engine/pieces.ts` | Splitting large videos into pieces and joining them again |
+| `web/src/engine/mediaWorker.ts` and `web/public/media-sw.js` | Playing and saving a stored video through a service worker |
 | `web/src/components/` | The interface |
 | `web/src/components/ui/` | [Liqui UI](https://liqui.design) components, installed as source |
 | `vercel.json` | How to build the site, and the security headers it must be served with |

@@ -81,6 +81,7 @@ export class FakeStorage implements StorageBackend {
   /** Test hook that receives the arguments of every stored photo. */
   onPut: ((input: PutPhotoInput) => void) | null = null;
   fetchCount = 0;
+  rangeFetchCount = 0;
   thumbFetchCount = 0;
   stateWrites = 0;
 
@@ -176,6 +177,14 @@ export class FakeStorage implements StorageBackend {
       }
     }
     return { size: file.size, stream: chunks() };
+  }
+
+  async getPhotoRange(ctx: StorageContext, messageId: number, start: number, end: number): Promise<Uint8Array> {
+    this.rangeFetchCount++;
+    if (this.failReads) throw this.failReads;
+    const stored = await this.disk.get<StoredMessage>(this.messageKey(ctx.session, messageId));
+    if (!stored) throw new OriginalMissingError();
+    return new Uint8Array(await stored.file.slice(start, end).arrayBuffer());
   }
 
   async getThumb(ctx: StorageContext, messageId: number): Promise<Blob | null> {

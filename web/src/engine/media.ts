@@ -19,6 +19,12 @@ const BROWSER_DECODE_LIMIT_BYTES = 512 * 1024 * 1024;
 /** Cameras put the embedded preview near the start of a file. */
 const EMBEDDED_PREVIEW_SEARCH_BYTES = 32 * 1024 * 1024;
 const HASH_CHUNK_BYTES = 8 * 1024 * 1024;
+/** Longer than any sensible video takes to open, and short enough that one that never does cannot hold up the upload. */
+const VIDEO_FRAME_TIMEOUT_MS = 20_000;
+/** Seconds between the MP4 epoch of 1904 and the Unix one. */
+const MP4_EPOCH_OFFSET = 2_082_844_800;
+/** No real file has more boxes than this before its metadata, so this only ever stops a damaged one. */
+const MP4_MAX_BOXES = 256;
 
 export interface PhotoMetadata extends CameraMeta {
   takenAt: string | null;
@@ -39,8 +45,8 @@ export interface Previews {
 
 /** The parts that need a real browser are behind this, so the engine's logic can be tested without one. */
 export interface MediaTools {
-  sniffImage(file: Blob): Promise<{ mime: string; ext: string } | null>;
-  readMetadata(file: Blob): Promise<PhotoMetadata>;
+  sniffMedia(file: Blob): Promise<{ mime: string; ext: string } | null>;
+  readMetadata(file: Blob, mime: string): Promise<PhotoMetadata>;
   makePreviews(file: Blob, mime: string): Promise<Previews | null>;
 }
 
@@ -80,9 +86,9 @@ export async function hashBlob(file: Blob, onProgress?: (fraction: number) => vo
 }
 
 /** Looks at the file's actual bytes, because a browser's name and type can say anything. */
-export async function sniffImage(file: Blob): Promise<{ mime: string; ext: string } | null> {
+export async function sniffMedia(file: Blob): Promise<{ mime: string; ext: string } | null> {
   const type = await fileTypeFromBlob(file).catch(() => undefined);
-  if (!type?.mime.startsWith('image/')) return null;
+  if (!type?.mime.startsWith('image/') && !type?.mime.startsWith('video/')) return null;
   return { mime: type.mime, ext: type.ext };
 }
 
@@ -104,7 +110,46 @@ export function parseExifDate(v: unknown): string | null {
   return `${y}-${mo}-${d}T${h}:${mi}:${s}`;
 }
 
-export async function readMetadata(file: Blob): Promise<PhotoMetadata> {
+/** Walks a run of MP4 boxes looking for one type, reading only their headers, as a box can be gigabytes long. */
+async function findMp4Box(file: Blob, type: string, from: number, to: number): Promise<{ start: number; end: number } | null> {
+  let at = from;
+  for (let seen = 0; seen < MP4_MAX_BOXES && at + 8 <= to; seen++) {
+    const header = new DataView(await file.slice(at, at + 16).arrayBuffer());
+    const name = String.fromCharCode(header.getUint8(4), header.getUint8(5), header.getUint8(6), header.getUint8(7));
+    const short = header.getUint32(0);
+    const wide = short === 1;
+    const size = wide ? Number(header.getBigUint64(8)) : short === 0 ? to - at : short;
+    const start = at + (wide ? 16 : 8);
+    if (size < start - at) return null;
+    if (name === type) return { start, end: at + size };
+    at += size;
+  }
+  return null;
+}
+
+/**
+ * When an MP4 or MOV was recorded, from its movie header. It is the nearest thing a video has to a
+ * photo's EXIF date. It is stored as UTC, unlike EXIF, so this converts it to the local wall clock.
+ */
+export async function readVideoDate(file: Blob): Promise<string | null> {
+  try {
+    const moov = await findMp4Box(file, 'moov', 0, file.size);
+    const mvhd = moov && (await findMp4Box(file, 'mvhd', moov.start, moov.end));
+    if (!mvhd) return null;
+    const header = new DataView(await file.slice(mvhd.start, mvhd.start + 12).arrayBuffer());
+    const seconds = header.getUint8(0) === 1 ? Number(header.getBigUint64(4)) : header.getUint32(4);
+    const unix = seconds - MP4_EPOCH_OFFSET;
+    // Devices with no clock set write zero, or a date from long before they were made.
+    if (unix < Date.UTC(1990, 0, 1) / 1000 || unix * 1000 > Date.now() + 86_400_000) return null;
+    const date = new Date(unix * 1000);
+    return new Date(date.getTime() - date.getTimezoneOffset() * 60_000).toISOString().slice(0, 19);
+  } catch {
+    return null;
+  }
+}
+
+export async function readMetadata(file: Blob, mime: string): Promise<PhotoMetadata> {
+  if (mime.startsWith('video/')) return { ...EMPTY_METADATA, takenAt: await readVideoDate(file) };
   try {
     const t = await exifr.parse(new Uint8Array(await file.slice(0, EMBEDDED_PREVIEW_SEARCH_BYTES).arrayBuffer()), {
       tiff: true, exif: true, gps: true, ifd1: false, interop: false, xmp: false, icc: false,
@@ -178,8 +223,40 @@ async function encodeTelegramThumb(bitmap: ImageBitmap): Promise<Blob> {
   return thumb;
 }
 
+/**
+ * A frame from a little way in, as many videos open on black. The browser reads only what it needs
+ * of the file, so the size does not matter. Null if this browser cannot play the format.
+ */
+function videoFrame(file: Blob): Promise<ImageBitmap | null> {
+  return new Promise((resolve) => {
+    const url = URL.createObjectURL(file);
+    const video = document.createElement('video');
+    const finish = (bitmap: ImageBitmap | null) => {
+      clearTimeout(timer);
+      video.removeAttribute('src');
+      video.load();
+      URL.revokeObjectURL(url);
+      resolve(bitmap);
+    };
+    const timer = setTimeout(() => finish(null), VIDEO_FRAME_TIMEOUT_MS);
+    video.muted = true;
+    video.playsInline = true;
+    video.preload = 'auto';
+    video.onerror = () => finish(null);
+    video.onloadedmetadata = () => {
+      if (video.videoWidth === 0) finish(null);
+      // A file written as it was recorded may not know how long it is.
+      else video.currentTime = Number.isFinite(video.duration) ? Math.min(1, video.duration / 2) : 0.1;
+    };
+    video.onseeked = () => void createImageBitmap(video).then(finish, () => finish(null));
+    video.src = url;
+  });
+}
+
 /** Tries what the browser can read itself, then libheif for iPhone photos, then a camera's embedded JPEG. */
 async function decode(file: Blob, mime: string): Promise<ImageBitmap | null> {
+  if (mime.startsWith('video/')) return videoFrame(file);
+
   if (file.size <= BROWSER_DECODE_LIMIT_BYTES) {
     try {
       return await createImageBitmap(file, { imageOrientation: 'from-image' });
@@ -214,8 +291,8 @@ async function decode(file: Blob, mime: string): Promise<ImageBitmap | null> {
  * Writes the web-sized copies the app displays. These only ever affect what is shown. The original
  * is never touched by this function.
  *
- * Returns null if nothing in the chain could read the image. That does not fail the upload: the
- * photo is stored in Telegram regardless and gets a placeholder tile.
+ * Returns null if nothing in the chain could read the file. That does not fail the upload: it is
+ * stored in Telegram regardless and gets a placeholder tile.
  */
 export async function makePreviews(file: Blob, mime: string): Promise<Previews | null> {
   const bitmap = await decode(file, mime);
@@ -233,4 +310,4 @@ export async function makePreviews(file: Blob, mime: string): Promise<Previews |
   }
 }
 
-export const browserMedia: MediaTools = { sniffImage, readMetadata, makePreviews };
+export const browserMedia: MediaTools = { sniffMedia, readMetadata, makePreviews };

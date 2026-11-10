@@ -71,9 +71,11 @@ export interface StorageBackend {
   submitLoginPassword(loginId: string, password: string): Promise<LoginSuccess>;
 
   ensureLibrary(session: string): Promise<EnsureLibraryResult>;
-  /** Stores one file as exactly one message, byte for byte. Rejects if Telegram altered it. */
+  /** Stores one file, or one piece of a large one, as exactly one message, byte for byte. Rejects if Telegram altered it. */
   putPhoto(ctx: StorageContext, input: PutPhotoInput, onProgress: (fraction: number) => void): Promise<{ messageId: number }>;
   getPhoto(ctx: StorageContext, messageId: number): Promise<{ size: number; stream: AsyncIterable<Uint8Array> }>;
+  /** Just the bytes from `start` up to but not including `end`, which is what lets a video seek without downloading it all. */
+  getPhotoRange(ctx: StorageContext, messageId: number, start: number, end: number): Promise<Uint8Array>;
   /** The thumbnail stored with a photo, or null if it has none. */
   getThumb(ctx: StorageContext, messageId: number): Promise<Blob | null>;
   deletePhotos(ctx: StorageContext, messageIds: number[]): Promise<void>;

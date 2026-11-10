@@ -21,7 +21,7 @@ import { setTheme, type ThemeChoice, useTheme } from '@/hooks/useTheme';
 import { useUploadStatus } from '@/hooks/useUploadStatus';
 import { formatCount } from '@/lib/format';
 import { QUICK } from '@/lib/motion';
-import { filesFromDrop, uploader } from '@/lib/uploads';
+import { ACCEPTED_FILES, filesFromDrop, uploader } from '@/lib/uploads';
 import { AlbumPage, AlbumsPage, FavoritesPage, PhotosPage, SearchPage, TrashPage } from '@/pages/Pages';
 
 const NAV = [
@@ -324,7 +324,7 @@ export function Shell({ account, storage, onReauth }: ShellProps) {
     if (skipped > 0) {
       toast.add({
         title: `${formatCount(skipped, 'file')} skipped`,
-        description: added > 0 ? 'Only photos can be stored for now, so the rest were left out.' : 'Only photos can be stored for now.',
+        description: added > 0 ? 'Only photos and videos can be stored, so the rest were left out.' : 'Only photos and videos can be stored.',
       });
     }
   }).current;
@@ -342,7 +342,7 @@ export function Shell({ account, storage, onReauth }: ShellProps) {
         type="file"
         multiple
         hidden
-        accept="image/*,.heic,.heif,.dng,.cr2,.cr3,.nef,.arw,.orf,.rw2,.raf,.pef,.srw"
+        accept={ACCEPTED_FILES}
         onChange={(event) => {
           addFiles([...(event.target.files ?? [])]);
           event.target.value = '';
@@ -353,7 +353,7 @@ export function Shell({ account, storage, onReauth }: ShellProps) {
         <SearchBox />
         <CrystalButton
           onClick={openFilePicker}
-          aria-label={uploadAlbumTitle ? `Upload photos to ${uploadAlbumTitle}` : 'Upload photos'}
+          aria-label={uploadAlbumTitle ? `Upload photos and videos to ${uploadAlbumTitle}` : 'Upload photos and videos'}
           title={uploadAlbumTitle ? `Upload to ${uploadAlbumTitle} only` : undefined}
           className="h-12 flex-none px-[22px] max-[519px]:w-12 max-[519px]:px-0"
         >

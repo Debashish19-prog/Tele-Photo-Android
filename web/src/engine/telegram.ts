@@ -525,6 +525,37 @@ export class TelegramStorage implements StorageBackend {
     });
   }
 
+  /** Telegram only serves whole blocks from aligned offsets, so this fetches those and trims the ends. */
+  async getPhotoRange(ctx: StorageContext, messageId: number, start: number, end: number): Promise<Uint8Array> {
+    return guard(async () => {
+      const client = await this.client(ctx.session);
+      const first = Math.floor(start / DOWNLOAD_REQUEST_BYTES);
+      const last = Math.ceil(end / DOWNLOAD_REQUEST_BYTES);
+      const blocks = Array.from({ length: last - first }, (_, i) => first + i);
+      for (let attempt = 0; ; attempt++) {
+        // Not fetched fresh as `getPhoto` does: a playing video reads constantly, and one extra call per read adds up.
+        const media = await this.lookupMedia(client, ctx, messageId);
+        if (!media) throw new OriginalMissingError();
+        try {
+          // Side by side, so high-bitrate video is not limited to one block per round trip.
+          const bytes = Buffer.concat(await Promise.all(blocks.map((block) => this.readBlock(client, media, block))));
+          const skip = start - first * DOWNLOAD_REQUEST_BYTES;
+          return bytes.subarray(skip, skip + (end - start));
+        } catch (err) {
+          if (attempt > 0 || !STALE_REFERENCE_ERRORS.has(rpcCode(err) ?? '')) throw err;
+          this.mediaCache.delete(messageId);
+        }
+      }
+    });
+  }
+
+  private async readBlock(client: TelegramClient, media: DocumentMedia, block: number): Promise<Buffer> {
+    const stream = client.iterDownload({ file: media, offset: bigInt(block).multiply(DOWNLOAD_REQUEST_BYTES), requestSize: DOWNLOAD_REQUEST_BYTES, limit: 1 });
+    const chunks: Buffer[] = [];
+    for await (const chunk of stream) chunks.push(chunk);
+    return Buffer.concat(chunks);
+  }
+
   /** Requests made within a few milliseconds of each other share one call, as a grid asks for dozens at once. */
   private lookupMedia(client: TelegramClient, ctx: StorageContext, messageId: number): Promise<DocumentMedia | null> {
     const cached = this.mediaCache.get(messageId);

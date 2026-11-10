@@ -1,6 +1,7 @@
 import { downloadZip } from 'client-zip';
 import { androidBridge, saveThroughApp } from './android';
 import type { Engine } from './index';
+import { saveThroughWorker } from './mediaWorker';
 import type { PhotoRow } from './store';
 
 /** Past this it is worth asking where to save, so the file can go straight to disk instead of through memory. */
@@ -85,6 +86,12 @@ export async function downloadOriginals(engine: Engine, ids: number[]): Promise<
     const body = single ? toStream(await engine.openOriginalStream(single.id)) : zipOf(engine, photos).body!;
     await body.pipeTo(writable);
     return;
+  }
+
+  // No save dialog in this browser. Gathering this much into a Blob first could easily fail, so it goes straight to disk another way.
+  if (total > STREAM_TO_DISK_BYTES) {
+    const open = async () => (single ? toStream(await engine.openOriginalStream(single.id)) : zipOf(engine, photos).body!);
+    if (await saveThroughWorker(filename, single ? single.size : null, open)) return;
   }
 
   const blob = single ? await engine.original(single.id) : await zipOf(engine, photos).blob();

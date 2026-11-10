@@ -17,6 +17,8 @@ const apiHash = (import.meta.env.VITE_TELEGRAM_API_HASH ?? '').trim();
 const isFake = import.meta.env.VITE_STORAGE === 'fake';
 const hasKeys = Number.isFinite(apiId) && apiId > 0 && apiHash !== '';
 const retention = Number.parseInt(import.meta.env.VITE_TRASH_RETENTION_DAYS ?? '', 10);
+/** Lets demo mode try splitting without gigabytes of video. Real Telegram always uses its real limits. */
+const fakePieceBytes = isFake ? Number.parseInt(import.meta.env.VITE_FAKE_PIECE_BYTES ?? '', 10) : Number.NaN;
 
 let starting: Promise<Engine> | null = null;
 let autoSync: AutoSync | null = null;
@@ -44,6 +46,7 @@ async function boot(): Promise<Engine> {
     storage,
     configured: isFake || hasKeys,
     trashRetentionDays: Number.isFinite(retention) && retention > 0 ? retention : undefined,
+    split: fakePieceBytes > 0 ? { maxSingleBytes: fakePieceBytes, pieceBytes: fakePieceBytes } : undefined,
   });
   await startAutoSync(engine);
   return engine;

@@ -168,9 +168,11 @@ describe('the engine', () => {
       expect(d.names()).toEqual([]);
     });
 
-    it('rejects a video named like a photo', async () => {
+    it('goes by what a file is, so a video named like a photo is stored as a video', async () => {
       const mp4 = Buffer.concat([Buffer.from([0, 0, 0, 0x18]), Buffer.from('ftypmp42'), Buffer.alloc(200)]);
-      await expect(d.add(mp4, 'clip.jpg')).rejects.toMatchObject({ status: 415 });
+      const id = await d.stored(mp4, 'clip.jpg');
+      expect(e().photo(id).mime).toBe('video/mp4');
+      expect(e().photos({})[0]!.isVideo).toBe(true);
     });
 
     it('rejects an empty file', async () => {

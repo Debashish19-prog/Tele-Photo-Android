@@ -1,7 +1,8 @@
 import { createHash } from 'node:crypto';
 import { Engine, type IngestResult } from '../src/engine/index';
 import { FakeStorage, type FakeDisk, memoryDisk } from '../src/engine/fake';
-import { readMetadata, sniffImage, type MediaTools, type Previews } from '../src/engine/media';
+import { readMetadata, sniffMedia, type MediaTools, type Previews } from '../src/engine/media';
+import type { SplitPolicy } from '../src/engine/pieces';
 
 export const sha256 = (b: Uint8Array) => createHash('sha256').update(b).digest('hex');
 export const blobBytes = async (b: Blob) => new Uint8Array(await b.arrayBuffer());
@@ -77,14 +78,45 @@ function jpegSize(bytes: Uint8Array): { width: number; height: number } | null {
 
 /** Everything real except the pixel work, which needs a browser and is tested in one. */
 export const testMedia: MediaTools = {
-  sniffImage,
+  sniffMedia,
   readMetadata,
-  async makePreviews(file): Promise<Previews | null> {
-    const size = jpegSize(await blobBytes(file));
+  async makePreviews(file, mime): Promise<Previews | null> {
+    const size = mime.startsWith('video/') ? { width: 1920, height: 1080 } : jpegSize(await blobBytes(file));
     if (!size) return null;
     return { ...size, thumb: new Blob(['grid-thumb'], { type: 'image/webp' }), preview: new Blob(['viewer-preview'], { type: 'image/webp' }), telegramThumb: new Blob(['telegram-thumb'], { type: 'image/jpeg' }) };
   },
 };
+
+/**
+ * The start of a real MP4 as far as anything here looks: a file type box, a movie header holding
+ * when it was recorded, and `size` bytes of video data that differ from one `seed` to the next.
+ * The header goes after the data when `moovAtEnd` is set, as it does in many cameras' files.
+ */
+export function makeMp4(options: { size?: number; seed?: number; recordedAt?: Date; wideMvhd?: boolean; moovAtEnd?: boolean } = {}): Uint8Array {
+  const { size = 1000, seed = 1, recordedAt = new Date(Date.UTC(2023, 2, 4, 5, 6, 7)), wideMvhd = false, moovAtEnd = false } = options;
+  const box = (name: string, body: Uint8Array) => {
+    const out = Buffer.alloc(8 + body.length);
+    out.writeUInt32BE(out.length, 0);
+    out.write(name, 4, 'latin1');
+    out.set(body, 8);
+    return out;
+  };
+  const seconds = Math.floor(recordedAt.getTime() / 1000) + 2_082_844_800;
+  const body = Buffer.alloc(wideMvhd ? 112 : 100);
+  body.writeUInt8(wideMvhd ? 1 : 0, 0);
+  if (wideMvhd) body.writeBigUInt64BE(BigInt(seconds), 4);
+  else body.writeUInt32BE(seconds, 4);
+  const ftyp = box('ftyp', new Uint8Array(Buffer.from('mp42\0\0\0\0mp42isom', 'latin1')));
+  const moov = box('moov', new Uint8Array(box('mvhd', new Uint8Array(body))));
+  const data = Buffer.alloc(size);
+  let x = seed * 2654435761;
+  for (let i = 0; i < size; i++) {
+    x = (x * 1664525 + 1013904223) >>> 0;
+    data[i] = x >>> 24;
+  }
+  const mdat = box('mdat', new Uint8Array(data));
+  return new Uint8Array(Buffer.concat(moovAtEnd ? [ftyp, mdat, moov] : [ftyp, moov, mdat]));
+}
 
 let counter = 0;
 
@@ -93,13 +125,15 @@ export class Device {
   engine!: Engine;
   readonly storage: FakeStorage;
   dbName = `tp-test-${process.pid}-${++counter}`;
+  private split: SplitPolicy | undefined;
 
   constructor(readonly disk: FakeDisk = memoryDisk(), storage?: FakeStorage) {
     this.storage = storage ?? new FakeStorage(disk);
   }
 
-  async open(options: { trashRetentionDays?: number } = {}): Promise<this> {
-    this.engine = await Engine.open({ storage: this.storage, configured: true, media: testMedia, dbName: this.dbName, ...options });
+  async open(options: { trashRetentionDays?: number; split?: SplitPolicy } = {}): Promise<this> {
+    this.split = options.split ?? this.split;
+    this.engine = await Engine.open({ storage: this.storage, configured: true, media: testMedia, dbName: this.dbName, ...options, split: this.split });
     return this;
   }
 

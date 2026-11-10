@@ -1,5 +1,6 @@
 import type { Engine } from './index';
 import { hashBlob } from './media';
+import { joinPieces, locateRange, PIECE_MIME, type StoredPiece } from './pieces';
 import { collectBlob } from './queue';
 import { decodeDoc, encodeDoc } from './sync';
 import type { StorageContext } from './types';
@@ -15,6 +16,9 @@ export interface VerifyResult {
 const CAPTION = 'Tele-Photo storage check. Safe to delete.';
 /** Telegram switches to its big-file call above 10 MB, and that path deserves checking too. */
 const BIG_SIDE = 2200;
+/** Over one of Telegram's 512 KiB blocks, so that reading part of one has to cross between them. */
+const SPLIT_CHECK_PIECE_BYTES = 700 * 1024;
+const SPLIT_CHECK_PIECES = 3;
 
 /** Noise, so every run produces new bytes and nothing can match an earlier upload. */
 function noiseCanvas(width: number, height: number): OffscreenCanvas {
@@ -42,6 +46,18 @@ function randomGif(): Blob {
   );
 }
 
+function randomBytes(size: number): Uint8Array {
+  const bytes = new Uint8Array(size);
+  for (let at = 0; at < size; at += 65536) crypto.getRandomValues(bytes.subarray(at, at + 65536));
+  return bytes;
+}
+
+/** Starts the way an MP4 does, which is all that decides how Telegram treats a file sent as a document. */
+function randomMp4(): Blob {
+  const brand = new Uint8Array([0, 0, 0, 0x18, 0x66, 0x74, 0x79, 0x70, 0x6d, 0x70, 0x34, 0x32, 0, 0, 0, 0, 0x6d, 0x70, 0x34, 0x32, 0x69, 0x73, 0x6f, 0x6d]);
+  return new Blob([brand, randomBytes(1024 * 1024) as BlobPart], { type: 'video/mp4' });
+}
+
 async function samples(): Promise<{ name: string; mime: string; why: string; file: Blob }[]> {
   return [
     { name: 'check.jpg', mime: 'image/jpeg', why: 'Telegram recompresses JPEGs sent as photos', file: await noiseCanvas(800, 600).convertToBlob({ type: 'image/jpeg', quality: 0.95 }) },
@@ -49,13 +65,56 @@ async function samples(): Promise<{ name: string; mime: string; why: string; fil
     { name: 'check.webp', mime: 'image/webp', why: 'Could be treated as a sticker', file: await noiseCanvas(400, 300).convertToBlob({ type: 'image/webp', quality: 0.9 }) },
     { name: 'check.gif', mime: 'image/gif', why: 'Could be converted to an MP4', file: randomGif() },
     { name: 'check-big.png', mime: 'image/png', why: 'Over 10 MB, so it uses the big-file call', file: await noiseCanvas(BIG_SIDE, BIG_SIDE).convertToBlob({ type: 'image/png' }) },
+    { name: 'check.mp4', mime: 'video/mp4', why: 'Could be re-encoded if treated as a video', file: randomMp4() },
   ];
+}
+
+/**
+ * What a video too large for one message depends on: its pieces, joined in order, come back as the
+ * original, and any stretch of it can be read on its own, which is what seeking does.
+ */
+async function checkSplitting(engine: Engine, context: StorageContext): Promise<VerifyResult> {
+  const result = { name: 'Video in pieces', why: 'Telegram takes at most 2 GB per file', size: SPLIT_CHECK_PIECE_BYTES * SPLIT_CHECK_PIECES };
+  const whole = randomBytes(result.size);
+  const pieces: StoredPiece[] = [];
+  try {
+    for (let i = 0; i < SPLIT_CHECK_PIECES; i++) {
+      const file = new Blob([whole.subarray(i * SPLIT_CHECK_PIECE_BYTES, (i + 1) * SPLIT_CHECK_PIECE_BYTES) as BlobPart]);
+      const { messageId } = await engine.storage.putPhoto(context, { file, thumb: null, filename: `check.bin.00${i + 1}`, mime: PIECE_MIME, size: file.size, caption: CAPTION }, () => undefined);
+      pieces.push({ messageId, size: file.size });
+    }
+    const joined = await collectBlob(joinPieces(engine.storage, context, pieces), PIECE_MIME);
+    if ((await hashBlob(joined)) !== (await hashBlob(new Blob([whole as BlobPart])))) {
+      return { ...result, pass: false, detail: 'The pieces joined together are different from the original' };
+    }
+
+    // From partway through one piece to partway through the next, as a seek landing near a boundary would.
+    const start = SPLIT_CHECK_PIECE_BYTES - 100_000;
+    const end = start + 800_000;
+    const chunks: BlobPart[] = [];
+    for (let at = start; at < end; ) {
+      const spot = locateRange(pieces, at, end);
+      if (!spot) break;
+      const bytes = await engine.storage.getPhotoRange(context, spot.messageId, spot.start, spot.end);
+      if (bytes.length === 0) break;
+      chunks.push(bytes as BlobPart);
+      at += bytes.length;
+    }
+    if ((await hashBlob(new Blob(chunks))) !== (await hashBlob(new Blob([whole.subarray(start, end) as BlobPart])))) {
+      return { ...result, pass: false, detail: 'Reading part of it gave different bytes, so seeking would not work' };
+    }
+    return { ...result, pass: true, detail: 'Joined back identically, and part of it read back correctly' };
+  } catch (err) {
+    return { ...result, pass: false, detail: err instanceof Error ? err.message : String(err) };
+  } finally {
+    if (pieces.length > 0) await engine.storage.deletePhotos(context, pieces.map((p) => p.messageId)).catch(() => undefined);
+  }
 }
 
 /**
  * Proves the thing tests cannot: that real Telegram gives back exactly the bytes it was given.
  *
- * Sends a few generated images to the library channel, downloads each one, compares SHA-256
+ * Sends a few generated files to the library channel, downloads each one, compares SHA-256
  * hashes, and deletes them again. Their captions have no photo marker, so even if a delete fails
  * they can never appear in the library.
  */
@@ -94,6 +153,8 @@ export async function verifyStorage(engine: Engine, context: StorageContext, onR
       if (messageId !== null) await engine.storage.deletePhotos(context, [messageId]).catch(() => undefined);
     }
   }
+
+  report(await checkSplitting(engine, context));
 
   // The real saved state must not be disturbed, so this writes what is already there back again.
   try {

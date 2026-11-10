@@ -205,6 +205,68 @@ describe('reading a photo back over the wire', () => {
     const { wire } = wireServing(null);
     await expect(storageOver(wire).getPhoto(CTX, 5)).rejects.toBeInstanceOf(OriginalMissingError);
   });
+
+  describe('reading only part of a file, as seeking in a video does', () => {
+    const BLOCK = 512 * 1024;
+    const SIZE = 3 * BLOCK + 777;
+
+    it.each([
+      ['within one block', 1000, 2000],
+      ['across blocks, from an unaligned start', 300_000, 1_200_000],
+      ['exactly one block', BLOCK, 2 * BLOCK],
+      ['in the last, short block', SIZE - 100, SIZE],
+      ['a single byte', BLOCK, BLOCK + 1],
+    ])('returns just those bytes when the range is %s', async (_label, start, end) => {
+      const data = randomBytes(SIZE);
+      const { wire, requests } = wireServing(data);
+      const bytes = await storageOver(wire).getPhotoRange(CTX, 5, start, end);
+      expect(Buffer.from(bytes).equals(data.subarray(start, end))).toBe(true);
+      // Telegram rejects reads that are not aligned to these sizes.
+      for (const r of requests) {
+        expect(r.limit).toBe(BLOCK);
+        expect(r.offset.toJSNumber() % BLOCK).toBe(0);
+      }
+      expect(requests).toHaveLength(Math.ceil(end / BLOCK) - Math.floor(start / BLOCK));
+    });
+
+    it('does not look the message up again for every read', async () => {
+      const data = randomBytes(SIZE);
+      const { wire } = wireServing(data);
+      const stub = wire.client as unknown as Record<string, unknown>;
+      const getMessages = stub.getMessages as () => Promise<unknown>;
+      let lookups = 0;
+      stub.getMessages = () => {
+        lookups++;
+        return getMessages();
+      };
+      const storage = storageOver(wire);
+      await storage.getPhotoRange(CTX, 5, 0, 100);
+      await storage.getPhotoRange(CTX, 5, BLOCK, BLOCK + 100);
+      expect(lookups).toBe(1);
+    });
+
+    it('gets a new file reference and tries again when the old one has expired', async () => {
+      const data = randomBytes(SIZE);
+      const { wire } = wireServing(data);
+      const stub = wire.client as unknown as Record<string, unknown>;
+      const serve = stub.invokeWithSender as (req: Api.upload.GetFile) => Promise<unknown>;
+      let refused = false;
+      stub.invokeWithSender = async (req: Api.upload.GetFile) => {
+        if (!refused) {
+          refused = true;
+          throw Object.assign(new Error('expired'), { errorMessage: 'FILE_REFERENCE_EXPIRED' });
+        }
+        return serve(req);
+      };
+      const bytes = await storageOver(wire).getPhotoRange(CTX, 5, 10, 20);
+      expect(Buffer.from(bytes).equals(data.subarray(10, 20))).toBe(true);
+    });
+
+    it('says clearly when the message is gone', async () => {
+      const { wire } = wireServing(null);
+      await expect(storageOver(wire).getPhotoRange(CTX, 5, 0, 10)).rejects.toBeInstanceOf(OriginalMissingError);
+    });
+  });
 });
 
 describe('signing in', () => {

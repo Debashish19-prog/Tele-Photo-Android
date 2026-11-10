@@ -6,7 +6,7 @@ import { Dialog, DialogActions, DialogContent, DialogDismiss, DialogTitle } from
 import { formatBytes } from '@/lib/format';
 
 /** Five sample files, plus the file that holds albums and favorites. */
-const STEPS = 6;
+const STEPS = 8;
 
 /**
  * The one check automated tests cannot do: send real files through this account's real Telegram,
@@ -41,7 +41,7 @@ export function StorageCheckDialog({ open, onClose }: { open: boolean; onClose: 
       <DialogContent className="lq-solid" glass={{ frost: 1, blur: 6 }}>
         <DialogTitle>Check Telegram storage</DialogTitle>
         <p className="mt-1 text-[13.5px] text-[var(--lq-text-dim)]">
-          Sends a few generated images to your library channel, downloads them again, confirms every byte matches, and deletes them. It takes a minute or so and uses about 15 MB.
+          Sends a few generated files to your library channel, downloads them again, confirms every byte matches, and deletes them. It takes a minute or so and uses about 20 MB.
         </p>
         {results.length > 0 || running ? (
           <ul className="mt-3 flex flex-col gap-2">

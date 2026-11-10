@@ -1,7 +1,7 @@
 import { LiquiGlass } from '@liqui-design/glass';
 import { useQuery } from '@tanstack/react-query';
 import {
-  ArrowLeft, Calendar, Camera, ChevronLeft, ChevronRight, CloudCheck, CloudUpload, Download, FileImage, FolderPlus, Info,
+  ArrowLeft, Calendar, Camera, ChevronLeft, ChevronRight, CloudCheck, CloudUpload, Download, FileImage, FileVideo, FolderPlus, Info,
   MapPin, RotateCcw, Star, Trash2, TriangleAlert, X,
 } from 'lucide-react';
 import { AnimatePresence, type DragControls, motion, useDragControls, useIsPresent, usePresence, useReducedMotion } from 'motion/react';
@@ -13,6 +13,7 @@ import { Tip } from '@/components/IconAction';
 import { Toolbar, ToolbarButton, ToolbarGroup } from '@/components/ui/toolbar';
 import { preloadPreview, useMedia } from '@/hooks/useMedia';
 import { usePhotoActions } from '@/hooks/usePhotoActions';
+import { useVideoSource } from '@/hooks/useVideoSource';
 import { formatBytes, formatExposure, formatMegapixels, fullDate, timeOfDay } from '@/lib/format';
 import { type Box, CLOSE, CLOSE_MS, FLIGHT, fitBox, type Pose, poseFromTile, QUICK, REST, type Size, SPRING } from '@/lib/motion';
 
@@ -28,6 +29,8 @@ const DEFAULT_ASPECT = 1.5;
 const NAV_OFFSET = 90;
 const SWIPE_DISTANCE = 80;
 const SWIPE_SPEED = 500;
+/** The strip along the bottom of a video that belongs to its controls, so a drag there scrubs instead of swiping. */
+const VIDEO_CONTROLS_HEIGHT = 72;
 
 interface LightboxProps {
   photoId: number;
@@ -71,6 +74,13 @@ export function Lightbox({ photoId, items, mode, keysPaused, onNavigate, onClose
   const aspect = shapeWidth && shapeHeight ? shapeWidth / shapeHeight : DEFAULT_ASPECT;
   const box = stageSize ? fitBox(aspect, stageSize) : null;
   const previewState = item ? (item.noPreview ? 'unavailable' : item.previewComing ? 'missing' : 'ready') : photo?.previewState;
+  const isVideo = item?.isVideo ?? photo?.mime.startsWith('video/') ?? false;
+  const videoStream = useVideoSource(isVideo ? photoId : null);
+  // Remembered by id: a video still fading out can fail after the next one has opened, and that says nothing about the next one.
+  const [failedVideo, setFailedVideo] = useState<number | null>(null);
+  const videoFailed = failedVideo === photoId;
+  const isVideoRef = useRef(isVideo);
+  isVideoRef.current = isVideo;
 
   const lastIndex = useRef(index);
   const direction = index >= lastIndex.current ? 1 : -1;
@@ -104,6 +114,7 @@ export function Lightbox({ photoId, items, mode, keysPaused, onNavigate, onClose
   useEffect(() => {
     setView(VIEW_DEFAULT);
     setOriginalState('none');
+    setFailedVideo(null);
   }, [photoId]);
 
   // The page stays exactly where it was underneath, so closing lands back on the same photo.
@@ -135,7 +146,7 @@ export function Lightbox({ photoId, items, mode, keysPaused, onNavigate, onClose
 
   useEffect(() => {
     for (const neighbor of [previous, next]) {
-      if (!neighbor || neighbor.noPreview || neighbor.previewComing) continue;
+      if (!neighbor || neighbor.noPreview || neighbor.previewComing || neighbor.isVideo) continue;
       void api.photo(neighbor.id).then((info) => {
         if (info.size <= PRELOAD_MAX_BYTES) preloadPreview(neighbor.id);
       }, () => undefined);
@@ -166,8 +177,16 @@ export function Lightbox({ photoId, items, mode, keysPaused, onNavigate, onClose
     setOriginalState(original.url ? 'ready' : 'failed');
   }, [originalState, original.state, original.url]);
 
+  // Without a way to stream, a short video can still be fetched whole and played from memory.
+  const videoCanLoadWhole = isVideo && videoStream.state === 'unavailable' && photo !== undefined && photo.size <= AUTO_ORIGINAL_BYTES;
+  useEffect(() => {
+    if (videoCanLoadWhole) loadOriginal();
+  }, [videoCanLoadWhole, loadOriginal]);
+  const videoSrc = videoStream.url ?? (isVideo ? original.url : null);
+  const videoStuck = videoFailed || originalState === 'failed' || (videoStream.state === 'unavailable' && photo !== undefined && !videoCanLoadWhole);
+
   // Null when this device has no preview and making one would mean a very large download.
-  const preview = useMedia(photoId, 'preview', { enabled: previewState === 'ready' && originalState !== 'ready' });
+  const preview = useMedia(photoId, 'preview', { enabled: !isVideo && previewState === 'ready' && originalState !== 'ready' });
 
   const afterRemoval = useCallback(() => {
     if (next) onNavigate(next.id);
@@ -185,10 +204,13 @@ export function Lightbox({ photoId, items, mode, keysPaused, onNavigate, onClose
 
   useEffect(() => {
     const onKey = (event: KeyboardEvent) => {
-      if (!isPresent || keysPaused || event.metaKey || event.ctrlKey || event.altKey) return;
+      // A full-screen video keeps the keyboard, so Esc leaves full screen without closing the viewer too.
+      if (!isPresent || keysPaused || event.metaKey || event.ctrlKey || event.altKey || document.fullscreenElement) return;
+      // Once someone has clicked into a video, its arrow keys seek.
+      const inVideo = event.target instanceof HTMLVideoElement;
       if (event.key === 'Escape') onClose();
-      else if (event.key === 'ArrowLeft' && previous) onNavigate(previous.id);
-      else if (event.key === 'ArrowRight' && next) onNavigate(next.id);
+      else if (event.key === 'ArrowLeft' && previous && !inVideo) onNavigate(previous.id);
+      else if (event.key === 'ArrowRight' && next && !inVideo) onNavigate(next.id);
       else if (event.key === 'i') toggleInfo();
       else if (event.key === 'f' && mode === 'normal') toggleFavorite();
       else if ((event.key === 'Delete' || event.key === '#') && mode === 'normal') removeToTrash();
@@ -203,6 +225,7 @@ export function Lightbox({ photoId, items, mode, keysPaused, onNavigate, onClose
     if (!el) return;
     const onWheel = (event: WheelEvent) => {
       event.preventDefault();
+      if (isVideoRef.current) return;
       const rect = el.getBoundingClientRect();
       const px = event.clientX - rect.left - rect.width / 2;
       const py = event.clientY - rect.top - rect.height / 2;
@@ -221,8 +244,8 @@ export function Lightbox({ photoId, items, mode, keysPaused, onNavigate, onClose
   const zoomed = view.scale > 1;
   const canSwipe = !zoomed && !closing;
   const src = originalState === 'ready' ? original.url : preview.url;
-  const fetchingPreview = preview.state === 'loading' && previewState === 'ready' && originalState === 'none';
-  const previewTooLarge = preview.state === 'empty' && previewState === 'ready' && originalState === 'none';
+  const fetchingPreview = !isVideo && preview.state === 'loading' && previewState === 'ready' && originalState === 'none';
+  const previewTooLarge = !isVideo && preview.state === 'empty' && previewState === 'ready' && originalState === 'none';
   const chrome = { initial: { opacity: 0 }, animate: { opacity: closing ? 0 : 1 }, transition: QUICK };
   const stageKey = stageSize ? `${stageSize.width}/${stageSize.height}` : '';
 
@@ -249,13 +272,16 @@ export function Lightbox({ photoId, items, mode, keysPaused, onNavigate, onClose
         className={`absolute inset-y-0 left-0 touch-none select-none ${zoomed ? 'cursor-grab active:cursor-grabbing' : ''}`}
         style={{ right: infoOpen && isWide ? INFO_WIDTH : 0 }}
         onDoubleClick={(event) => {
+          if (isVideo) return;
           const rect = event.currentTarget.getBoundingClientRect();
           const px = event.clientX - rect.left - rect.width / 2;
           const py = event.clientY - rect.top - rect.height / 2;
           setView((current) => (current.scale > 1 ? VIEW_DEFAULT : { scale: 2.5, x: -px * 1.5, y: -py * 1.5 }));
         }}
         onPointerDown={(event) => {
-          if ((event.target as HTMLElement).closest('button, a, [role="toolbar"]')) return;
+          const target = event.target as HTMLElement;
+          if (target.closest('button, a, [role="toolbar"]')) return;
+          if (target instanceof HTMLVideoElement && event.clientY > target.getBoundingClientRect().bottom - VIDEO_CONTROLS_HEIGHT) return;
           if (zoomed) {
             event.currentTarget.setPointerCapture(event.pointerId);
             pan.current = { x: event.clientX, y: event.clientY };
@@ -276,7 +302,7 @@ export function Lightbox({ photoId, items, mode, keysPaused, onNavigate, onClose
         }}
       >
         <motion.div className="absolute inset-0" initial={false} animate={view} transition={pan.current ? { duration: 0 } : SPRING}>
-          {box && previewState === 'ready' ? (
+          {box && (isVideo ? !videoStuck : previewState === 'ready') ? (
             <AnimatePresence custom={direction}>
               <Hero
                 key={photoId}
@@ -288,6 +314,7 @@ export function Lightbox({ photoId, items, mode, keysPaused, onNavigate, onClose
                 direction={direction}
                 closingTo={closingTo}
                 src={src}
+                video={isVideo ? { src: videoSrc, onFailed: () => setFailedVideo(photoId) } : null}
                 alt={photo?.filename ?? item?.filename ?? ''}
                 dragControls={dragControls}
                 canSwipe={canSwipe}
@@ -297,7 +324,7 @@ export function Lightbox({ photoId, items, mode, keysPaused, onNavigate, onClose
           ) : null}
         </motion.div>
 
-        {previewState !== 'ready' && photo ? (
+        {(isVideo ? videoStuck : previewState !== 'ready') && photo ? (
           <motion.div key={photoId} {...chrome} className="absolute inset-0">
             <NoPreview photo={photo} onDownload={() => actions.download([photoId])} />
           </motion.div>
@@ -348,7 +375,7 @@ export function Lightbox({ photoId, items, mode, keysPaused, onNavigate, onClose
           {originalState === 'loading' ? <Chip>Loading the original from Telegram…</Chip> : null}
           {fetchingPreview ? <SlowChip>Loading from Telegram…</SlowChip> : null}
           {preview.state === 'failed' && originalState === 'none' ? <Chip>Couldn't reach Telegram. Showing what this device has.</Chip> : null}
-          {originalState === 'failed' ? <Chip>Couldn't load the original. Showing the preview.</Chip> : null}
+          {originalState === 'failed' && !isVideo ? <Chip>Couldn't load the original. Showing the preview.</Chip> : null}
           {originalState === 'none' && photo && webSafe && (previewTooLarge || (view.scale > 1.2 && photo.size > AUTO_ORIGINAL_BYTES)) ? (
             <Chip>
               <button type="button" className="pointer-events-auto cursor-pointer font-semibold underline" onClick={loadOriginal}>
@@ -374,6 +401,8 @@ interface HeroProps {
   direction: number;
   closingTo: Pose | null;
   src: string | null;
+  /** Set for a video, which plays from here instead of showing `src`. */
+  video: { src: string | null; onFailed: () => void } | null;
   alt: string;
   dragControls: DragControls;
   canSwipe: boolean;
@@ -381,7 +410,7 @@ interface HeroProps {
 }
 
 /** The photo itself. The thumbnail is usually already here, so it shows at once while the preview loads. */
-function Hero({ photoId, box, stage, flyFromTile, reducedMotion, direction, closingTo, src, alt, dragControls, canSwipe, onSwipe }: HeroProps) {
+function Hero({ photoId, box, stage, flyFromTile, reducedMotion, direction, closingTo, src, video, alt, dragControls, canSwipe, onSwipe }: HeroProps) {
   const isPresent = useIsPresent();
   const thumb = useMedia(photoId, 'thumb');
   const [loaded, setLoaded] = useState(false);
@@ -415,7 +444,9 @@ function Hero({ photoId, box, stage, flyFromTile, reducedMotion, direction, clos
       onDragEnd={(_, info) => onSwipe(info.offset.x, info.velocity.x)}
     >
       {thumb.url ? <img src={thumb.url} alt="" draggable={false} className={`absolute inset-0 size-full object-cover ${thumbDone ? 'invisible' : ''}`} /> : null}
-      {src ? (
+      {video ? (
+        <VideoPlayer src={video.src} playing={isPresent && !closingTo} onShowing={() => setThumbDone(true)} onFailed={video.onFailed} />
+      ) : src ? (
         <motion.img
           src={src}
           alt={alt}
@@ -429,6 +460,43 @@ function Hero({ photoId, box, stage, flyFromTile, reducedMotion, direction, clos
         />
       ) : null}
     </motion.div>
+  );
+}
+
+/** The browser's own player. It reads through the media worker, so it fetches only what it is about to show. */
+function VideoPlayer({ src, playing, onShowing, onFailed }: { src: string | null; playing: boolean; onShowing: () => void; onFailed: () => void }) {
+  const element = useRef<HTMLVideoElement>(null);
+
+  useEffect(() => {
+    if (!playing) element.current?.pause();
+  }, [playing]);
+
+  // Set here rather than as a prop so this can undo it: leaving the page is not enough to stop a
+  // <video>, and this one would carry on downloading from Telegram.
+  useEffect(() => {
+    const video = element.current;
+    if (!video || !src) return;
+    video.src = src;
+    return () => {
+      video.pause();
+      video.removeAttribute('src');
+      video.load();
+    };
+  }, [src]);
+
+  return (
+    <video
+      ref={element}
+      controls
+      autoPlay
+      playsInline
+      preload="metadata"
+      // The app has its own download, which saves the real file under its real name.
+      controlsList="nodownload"
+      className="absolute inset-0 size-full object-contain"
+      onLoadedData={onShowing}
+      onError={onFailed}
+    />
   );
 }
 
@@ -484,15 +552,19 @@ function SlowChip({ children }: { children: ReactNode }) {
 }
 
 function NoPreview({ photo, onDownload }: { photo: PhotoDetail; onDownload: () => void }) {
+  const isVideo = photo.mime.startsWith('video/');
+  const Icon = isVideo ? FileVideo : FileImage;
   return (
     <div className="absolute inset-0 grid place-items-center p-6 text-center">
       <div className="flex max-w-sm flex-col items-center gap-3">
-        <FileImage className="size-14 text-white/60" aria-hidden="true" />
+        <Icon className="size-14 text-white/60" aria-hidden="true" />
         <p className="text-base font-semibold">{photo.filename}</p>
         <p className="text-[13.5px] text-white/65">
-          {photo.previewState === 'missing'
-            ? 'A preview is being made from the copy in Telegram.'
-            : "This browser can't show this format, but the original is stored safely and unchanged."}
+          {isVideo
+            ? "This video can't play in this browser right now, but the original is stored safely and unchanged."
+            : photo.previewState === 'missing'
+              ? 'A preview is being made from the copy in Telegram.'
+              : "This browser can't show this format, but the original is stored safely and unchanged."}
         </p>
         <button type="button" onClick={onDownload} className="mt-1 cursor-pointer rounded-full bg-white px-4 py-2 text-[13.5px] font-semibold text-black">
           Download original ({formatBytes(photo.size)})
@@ -520,7 +592,10 @@ function Fact({ icon, title, lines }: { icon: ReactNode; title: ReactNode; lines
 
 function storageFact(photo: PhotoDetail) {
   if (photo.status === 'stored') {
-    return <Fact icon={<CloudCheck className="size-5" aria-hidden="true" />} title="In your Telegram" lines={['Original quality, unchanged', photo.telegramMessageId ? `Message #${photo.telegramMessageId} in Tele-Photo Library` : null]} />;
+    const where = photo.pieceCount > 1
+      ? `${photo.pieceCount} messages from #${photo.telegramMessageId} in Tele-Photo Library, as it is too large for one`
+      : photo.telegramMessageId ? `Message #${photo.telegramMessageId} in Tele-Photo Library` : null;
+    return <Fact icon={<CloudCheck className="size-5" aria-hidden="true" />} title="In your Telegram" lines={['Original quality, unchanged', where]} />;
   }
   if (photo.status === 'failed') {
     return <Fact icon={<TriangleAlert className="size-5 text-[#ff8a8f]" aria-hidden="true" />} title="Not in Telegram yet" lines={[photo.error, 'Your original is still on your device. Retry from the uploads panel, or add the file again.']} />;
@@ -543,6 +618,7 @@ function InfoPanel({ photo, sideways, onClose }: { photo: PhotoDetail | undefine
   ].filter(Boolean).join(' · ');
 
   const hidden = sideways ? { x: '100%' } : { y: '100%' };
+  const isVideo = photo?.mime.startsWith('video/') ?? false;
   const daysLeft = photo?.purgeAt ? Math.max(0, Math.ceil((photo.purgeAt - Date.now()) / 86_400_000)) : null;
 
   return (
@@ -572,10 +648,10 @@ function InfoPanel({ photo, sideways, onClose }: { photo: PhotoDetail | undefine
             lines={[timeOfDay(photo.takenAt), photo.takenSource === 'exif' || photo.takenSource === 'telegram' ? null : photo.takenSource === 'file' ? 'Date from the file, as it had no capture date' : 'Date of upload, as it had no capture date']}
           />
           <Fact
-            icon={<FileImage className="size-5" aria-hidden="true" />}
+            icon={isVideo ? <FileVideo className="size-5" aria-hidden="true" /> : <FileImage className="size-5" aria-hidden="true" />}
             title={photo.filename}
             lines={[
-              [photo.width && photo.height ? formatMegapixels(photo.width, photo.height) : null, photo.width && photo.height ? `${photo.width} × ${photo.height}` : null, formatBytes(photo.size)].filter(Boolean).join(' · '),
+              [photo.width && photo.height && !isVideo ? formatMegapixels(photo.width, photo.height) : null, photo.width && photo.height ? `${photo.width} × ${photo.height}` : null, formatBytes(photo.size)].filter(Boolean).join(' · '),
               photo.mime,
             ]}
           />

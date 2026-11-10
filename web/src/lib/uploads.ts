@@ -1,12 +1,17 @@
 import { ApiError, getEngine } from '@/api';
 import { toWallClock } from '@/lib/format';
 
-/** Telegram's single-file ceiling: 4000 parts of 512 KiB. The engine enforces the same number. */
+/** Telegram's single-file ceiling: 4000 parts of 512 KiB. A video over it goes in pieces, and a photo is refused. */
 export const MAX_PHOTO_BYTES = 4000 * 512 * 1024;
 const CONCURRENCY = 3;
 
 /** Browsers leave the type blank for many camera formats, so these are recognised by name. */
 const PHOTO_EXTENSIONS = /\.(jpe?g|png|gif|webp|avif|heic|heif|tiff?|bmp|jxl|dng|cr2|cr3|nef|arw|orf|rw2|raf|pef|srw)$/i;
+/** Not .ts: a browser that knows the video format says so in the type, and otherwise it is far more likely to be code. */
+const VIDEO_EXTENSIONS = /\.(mp4|m4v|mov|mkv|webm|avi|wmv|flv|ogv|3gp|3g2|mpe?g|mts|m2ts)$/i;
+
+/** For a file picker's `accept`. */
+export const ACCEPTED_FILES = 'image/*,video/*,.heic,.heif,.dng,.cr2,.cr3,.nef,.arw,.orf,.rw2,.raf,.pef,.srw,.mkv,.avi,.wmv,.flv,.mts,.m2ts';
 
 export type LocalStage = 'waiting' | 'sending' | 'received' | 'duplicate' | 'restored' | 'error';
 
@@ -62,12 +67,13 @@ class Uploader {
     let added = 0;
     let skipped = 0;
     for (const file of files) {
+      const looksLikeVideo = file.type.startsWith('video/') || VIDEO_EXTENSIONS.test(file.name);
       const looksLikePhoto = file.type.startsWith('image/') || PHOTO_EXTENSIONS.test(file.name);
-      if (!looksLikePhoto) {
+      if (!looksLikePhoto && !looksLikeVideo) {
         skipped++;
         continue;
       }
-      const tooBig = file.size > MAX_PHOTO_BYTES;
+      const tooBig = file.size > MAX_PHOTO_BYTES && !looksLikeVideo;
       this.entries.push({
         key: this.nextKey++,
         file: tooBig ? null : file,

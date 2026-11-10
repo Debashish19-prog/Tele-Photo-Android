@@ -1,4 +1,4 @@
-import { Check, CheckCircle2, Circle, CloudUpload, FileImage, Star, TriangleAlert } from 'lucide-react';
+import { Check, CheckCircle2, Circle, CloudUpload, FileImage, FileVideo, Play, Star, TriangleAlert } from 'lucide-react';
 import { AnimatePresence, motion } from 'motion/react';
 import { memo, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react';
 import type { PhotoItem } from '@/api';
@@ -62,7 +62,7 @@ const TileView = memo(function TileView({ tile, height, selected, selecting, hid
       {item.noPreview || item.previewComing ? (
         <div className={`grid size-full place-items-center p-2 text-center text-[var(--lq-text-dim)] ${item.previewComing ? 'shimmer' : ''}`}>
           <div className="flex flex-col items-center gap-1">
-            <FileImage className="size-7" aria-hidden="true" />
+            {item.isVideo ? <FileVideo className="size-7" aria-hidden="true" /> : <FileImage className="size-7" aria-hidden="true" />}
             <span className="text-[11px] font-bold tracking-wide">{extensionOf(item.filename)}</span>
           </div>
         </div>
@@ -70,6 +70,11 @@ const TileView = memo(function TileView({ tile, height, selected, selecting, hid
         <TileImage id={item.id} alt={item.filename} selected={selected} />
       )}
       <div className="tile-scrim" />
+      {item.isVideo ? (
+        <span className="pointer-events-none absolute top-1.5 right-1.5 grid size-6 place-items-center rounded-full bg-black/55 text-white">
+          <Play className="size-3 fill-current" aria-label="Video" />
+        </span>
+      ) : null}
       <button
         type="button"
         aria-label={`Open ${item.filename}`}

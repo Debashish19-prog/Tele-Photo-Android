@@ -1,6 +1,7 @@
 import { cleanFilename } from './caption';
 import { Library, type ScanState } from './library';
 import { browserMedia, hashBlob, mediaLimiter, type MediaTools } from './media';
+import { BlockCache, checkedAgainst, joinPieces, locateRange, piecesOf, planPieces, type SplitPolicy, TELEGRAM_SPLIT } from './pieces';
 import { collectBlob, INTERRUPTED_MESSAGE, PREVIEW_DOWNLOAD_LIMIT, UploadQueue } from './queue';
 import { StateSync } from './sync';
 import { type AccountRow, type LibraryStats, type PhotoRow, type PhotoView, Store } from './store';
@@ -17,17 +18,14 @@ import {
 export { UserFacingError } from './types';
 export type { LibraryStats, ScanState };
 
-/**
- * The most a non-Premium account can upload as a single file: 4000 parts of 512 KiB.
- * This is 2,097,152,000 bytes (about 1.95 GiB). Anything larger fails on Telegram's side
- * with FILE_PARTS_INVALID, so we refuse it before doing any work.
- */
-export const MAX_PHOTO_BYTES = 4000 * 512 * 1024;
+export { MAX_PHOTO_BYTES } from './pieces';
+
 const MAX_ZIP_PHOTOS = 2000;
 const DEFAULT_TRASH_RETENTION_DAYS = 30;
 /** Originals kept in memory after being viewed, so zooming in does not download one twice. */
 const RECENT_ORIGINALS = 3;
 const RECENT_ORIGINAL_MAX_BYTES = 60 * 1024 * 1024;
+const LOCAL_READ_BYTES = 2 * 1024 * 1024;
 
 export interface Account {
   id: number;
@@ -55,6 +53,7 @@ export interface PhotoItem {
   failed: boolean;
   noPreview: boolean;
   previewComing: boolean;
+  isVideo: boolean;
 }
 
 export interface PhotoDetail {
@@ -73,6 +72,8 @@ export interface PhotoDetail {
   status: 'queued' | 'uploading' | 'stored' | 'failed';
   error: string | null;
   telegramMessageId: number | null;
+  /** How many Telegram messages hold this. More than one for a video too large to send whole. */
+  pieceCount: number;
   previewState: 'ready' | 'missing' | 'unavailable';
   favorite: boolean;
   trashedAt: number | null;
@@ -142,6 +143,8 @@ export interface EngineOptions {
   media?: MediaTools;
   dbName?: string;
   trashRetentionDays?: number;
+  /** Only ever set for the pretend Telegram, so that splitting can be tried without gigabytes of video. */
+  split?: SplitPolicy;
 }
 
 export function normalizePhone(raw: string): string {
@@ -160,6 +163,8 @@ function albumTitle(raw: string): string {
   return title.slice(0, 200);
 }
 
+const isVideoMime = (mime: string) => mime.startsWith('video/');
+
 function toItem(p: PhotoRow): PhotoItem {
   return {
     id: p.id,
@@ -172,6 +177,7 @@ function toItem(p: PhotoRow): PhotoItem {
     failed: p.status === 'failed',
     noPreview: p.preview_state === 'unavailable',
     previewComing: p.preview_state === 'missing',
+    isVideo: isVideoMime(p.mime),
   };
 }
 
@@ -191,6 +197,7 @@ export class Engine {
   private readonly media: MediaTools;
   private readonly configured: boolean;
   private readonly retentionDays: number;
+  private readonly split: SplitPolicy;
   private revision = 0;
   private running = false;
   private catching: Promise<void> = Promise.resolve();
@@ -198,6 +205,7 @@ export class Engine {
   private catchUpFailure: unknown = null;
   private readonly originals = new Map<number, Blob>();
   private readonly originalLoads = new Map<number, Promise<Blob>>();
+  private readonly videoBlocks: BlockCache;
 
   private constructor(store: Store, options: EngineOptions) {
     this.store = store;
@@ -205,9 +213,11 @@ export class Engine {
     this.media = options.media ?? browserMedia;
     this.configured = options.configured;
     this.retentionDays = options.trashRetentionDays ?? DEFAULT_TRASH_RETENTION_DAYS;
+    this.split = options.split ?? TELEGRAM_SPLIT;
+    this.videoBlocks = new BlockCache(this.storage);
     const context = () => this.context();
     const onRevoked = () => void store.setNeedsReauth();
-    this.queue = new UploadQueue({ store, storage: this.storage, media: this.media, context, onRevoked });
+    this.queue = new UploadQueue({ store, storage: this.storage, media: this.media, context, onRevoked, split: this.split });
     this.sync = new StateSync({
       store,
       storage: this.storage,
@@ -307,18 +317,22 @@ export class Engine {
   }
 
   /** Turns the conditions that are nobody's fault into messages a person can act on. */
+  private async explanation(err: unknown): Promise<unknown> {
+    if (err instanceof SessionRevokedError) {
+      await this.store.setNeedsReauth();
+      return new UserFacingError('REAUTH', 'Telegram ended this session. Please sign in again.', 401);
+    }
+    if (err instanceof RateLimitedError) {
+      return new UserFacingError('RATE_LIMITED', `Telegram asked us to wait ${err.seconds} seconds. Try again shortly.`, 503);
+    }
+    return err;
+  }
+
   private async explained<T>(work: () => Promise<T>): Promise<T> {
     try {
       return await work();
     } catch (err) {
-      if (err instanceof SessionRevokedError) {
-        await this.store.setNeedsReauth();
-        throw new UserFacingError('REAUTH', 'Telegram ended this session. Please sign in again.', 401);
-      }
-      if (err instanceof RateLimitedError) {
-        throw new UserFacingError('RATE_LIMITED', `Telegram asked us to wait ${err.seconds} seconds. Try again shortly.`, 503);
-      }
-      throw err;
+      throw await this.explanation(err);
     }
   }
 
@@ -421,6 +435,7 @@ export class Engine {
     if (session) await this.storage.revokeSession(session).catch(() => undefined);
     await this.store.wipe();
     this.originals.clear();
+    this.videoBlocks.clear();
   }
 
   // ---- the library ---------------------------------------------------------------------------
@@ -463,6 +478,7 @@ export class Engine {
       status: p.status,
       error: p.last_error,
       telegramMessageId: p.tg_message_id,
+      pieceCount: p.tg_parts?.length ?? 1,
       previewState: p.preview_state,
       favorite: p.favorite,
       trashedAt: p.trashed_at,
@@ -569,8 +585,8 @@ export class Engine {
   // ---- uploads -------------------------------------------------------------------------------
 
   /**
-   * Takes in one file: checks it really is an image, recognises it if it has been seen before,
-   * makes its thumbnails, and queues it for Telegram. The file's bytes are never modified.
+   * Takes in one file: checks it really is an image or a video, recognises it if it has been seen
+   * before, makes its thumbnails, and queues it for Telegram. The file's bytes are never modified.
    */
   async ingest(file: Blob, rawName: string, lastModified: string | null, onProgress: (fraction: number) => void = () => undefined, options: IngestOptions = {}): Promise<IngestResult> {
     this.requireAccount();
@@ -579,10 +595,13 @@ export class Engine {
     const targetAlbum = () => (options.albumId !== undefined && store.getAlbum(options.albumId) ? options.albumId : null);
 
     if (file.size === 0) throw new UserFacingError('EMPTY_FILE', 'This file is empty.');
-    if (file.size > MAX_PHOTO_BYTES) throw new UserFacingError('TOO_LARGE', 'This file is larger than the 1.95 GB Telegram accepts in a single upload.', 413);
 
-    const type = await media.sniffImage(file);
-    if (!type) throw new UserFacingError('NOT_A_PHOTO', 'Only photos can be stored right now, and this file is not a recognised image format.', 415);
+    const type = await media.sniffMedia(file);
+    // Only a video goes in pieces. A photo that large is not something this app could ever show anyway.
+    if (planPieces(file.size, this.split).length > 1 && !(type && isVideoMime(type.mime))) {
+      throw new UserFacingError('TOO_LARGE', 'This file is larger than the 1.95 GB Telegram accepts in a single upload.', 413);
+    }
+    if (!type) throw new UserFacingError('NOT_A_PHOTO', 'Only photos and videos can be stored, and this file is not a recognised format.', 415);
 
     const sha256 = await hashBlob(file, onProgress);
     const known = store.getPhotoBySha(sha256);
@@ -605,10 +624,10 @@ export class Engine {
       return this.placeKnown(known, targetAlbum());
     }
     if (options.autoSync && this.sync.isDeleted(sha256)) return { id: 0, duplicate: true, restored: false, skipped: 'deleted' };
-    if (options.retryOnly) throw new UserFacingError('NOT_AN_UPLOAD', 'This file does not match an existing upload. Select the original photo again.');
+    if (options.retryOnly) throw new UserFacingError('NOT_AN_UPLOAD', 'This file does not match an existing upload. Select the original file again.');
 
     const fileDate = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}$/.test(lastModified ?? '') ? lastModified : null;
-    const [meta, shown] = await Promise.all([media.readMetadata(file), previews()]);
+    const [meta, shown] = await Promise.all([media.readMetadata(file, type.mime), previews()]);
 
     // The same bytes may have arrived twice at once, in which case the other one has won by now.
     const winner = store.getPhotoBySha(sha256);
@@ -733,6 +752,8 @@ export class Engine {
     const cached = await this.store.getPreview(photo.sha256);
     if (cached) return cached;
     if (photo.preview_state === 'unavailable') return null;
+    // Nothing is worth downloading a whole video for. The viewer plays the real thing anyway.
+    if (isVideoMime(photo.mime)) return this.thumb(id);
     if (!options.force && photo.size > PREVIEW_DOWNLOAD_LIMIT && !this.queue.hasFile(id)) return null;
 
     const original = await this.original(id);
@@ -745,7 +766,7 @@ export class Engine {
     if (!(await this.store.getThumb(photo.sha256))) await this.store.cacheThumb(photo.sha256, shown.thumb);
 
     // Opening a restored photo is the first chance to learn its camera details on this device.
-    const { takenAt: _takenAt, exifWidth: _w, exifHeight: _h, ...camera } = await this.media.readMetadata(original);
+    const { takenAt: _takenAt, exifWidth: _w, exifHeight: _h, ...camera } = await this.media.readMetadata(original, photo.mime);
     await this.store.markPreviewResult(id, 'ready', { ...camera, width: shown.width, height: shown.height });
     return shown.preview;
   }
@@ -763,8 +784,7 @@ export class Engine {
     if (photo.tg_message_id === null) throw new UserFacingError('FILE_NEEDED', INTERRUPTED_MESSAGE);
 
     const load = this.explained(async () => {
-      const { stream } = await this.storage.getPhoto(this.context(), photo.tg_message_id!);
-      const blob = await collectBlob(stream, photo.mime);
+      const blob = await collectBlob(await this.readStored(photo), photo.mime);
       if (blob.size <= RECENT_ORIGINAL_MAX_BYTES) {
         this.originals.set(id, blob);
         while (this.originals.size > RECENT_ORIGINALS) this.originals.delete(this.originals.keys().next().value!);
@@ -785,7 +805,41 @@ export class Engine {
       })();
     }
     if (photo.tg_message_id === null) throw new UserFacingError('FILE_NEEDED', INTERRUPTED_MESSAGE);
-    return this.explained(async () => (await this.storage.getPhoto(this.context(), photo.tg_message_id!)).stream);
+    return this.explained(() => this.readStored(photo));
+  }
+
+  /** Every byte of what Telegram holds, in order. Pieces are joined here, and checked, since joining them is where a mistake could creep in. */
+  private async readStored(photo: PhotoRow): Promise<AsyncIterable<Uint8Array>> {
+    if (photo.tg_parts) return this.explainedStream(checkedAgainst(photo.sha256, joinPieces(this.storage, this.context(), photo.tg_parts)));
+    return (await this.storage.getPhoto(this.context(), photo.tg_message_id!)).stream;
+  }
+
+  private async *explainedStream(source: AsyncIterable<Uint8Array>): AsyncIterable<Uint8Array> {
+    try {
+      yield* source;
+    } catch (err) {
+      throw await this.explanation(err);
+    }
+  }
+
+  /** What a player or a download needs to know about a stored file before asking for any of it. */
+  fileInfo(id: number): { size: number; mime: string; filename: string } {
+    const { size, mime, filename } = this.owned(id);
+    return { size, mime, filename };
+  }
+
+  /**
+   * Some of the bytes from `start` up to `end`, as a position in the whole file whichever pieces
+   * it is held in. This can return fewer than asked for, so a caller asks again from where it got to.
+   */
+  async readRange(id: number, start: number, end: number): Promise<Uint8Array> {
+    const photo = this.owned(id);
+    const local = this.queue.fileFor(id);
+    if (local) return new Uint8Array(await local.slice(start, Math.min(end, start + LOCAL_READ_BYTES)).arrayBuffer());
+    if (photo.tg_message_id === null) throw new UserFacingError('FILE_NEEDED', INTERRUPTED_MESSAGE);
+    const spot = locateRange(piecesOf(photo), start, end);
+    if (!spot) return new Uint8Array(0);
+    return this.explained(() => this.videoBlocks.read(this.context(), spot));
   }
 
   photosForDownload(ids: number[]): PhotoRow[] {

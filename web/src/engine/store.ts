@@ -1,3 +1,5 @@
+import type { StoredPiece } from './pieces';
+
 export type PhotoStatus = 'queued' | 'uploading' | 'stored' | 'failed';
 export type PreviewState = 'ready' | 'missing' | 'unavailable';
 
@@ -30,7 +32,13 @@ export interface PhotoRow extends CameraMeta {
   attempts: number;
   next_attempt_at: number;
   last_error: string | null;
+  /** The message holding the file, or its first piece, which is also the one with the thumbnail. */
   tg_message_id: number | null;
+  /**
+   * In order, for a file too large for one message. Filled in as each piece is confirmed, so an
+   * upload that stops partway has these with `tg_message_id` still null. Null for everything else.
+   */
+  tg_parts: StoredPiece[] | null;
   preview_state: PreviewState;
   preview_attempts: number;
   favorite: boolean;
@@ -72,7 +80,7 @@ export type NewPhoto = Pick<
   | 'sha256' | 'filename' | 'mime' | 'size' | 'width' | 'height' | 'taken_at' | 'taken_source'
   | 'camera_make' | 'camera_model' | 'lens' | 'iso' | 'f_number' | 'exposure_time' | 'focal_length'
   | 'gps_lat' | 'gps_lon' | 'status' | 'tg_message_id' | 'preview_state'
-> & { changed_at?: number; album_only?: boolean };
+> & { changed_at?: number; album_only?: boolean; tg_parts?: StoredPiece[] | null };
 
 export type PhotoView =
   | { kind: 'timeline' }
@@ -166,6 +174,8 @@ export class Store {
     for (const row of photos) {
       // Saved before album-only photos existed.
       row.album_only ??= false;
+      // Saved before videos could be split.
+      row.tg_parts ??= null;
       this.index(row);
     }
     for (const row of albums) this.albums.set(row.id, row);
@@ -267,6 +277,7 @@ export class Store {
         trashed_at: null,
         changed_at: photo.changed_at ?? 0,
         album_only: photo.album_only ?? false,
+        tg_parts: photo.tg_parts ?? null,
       };
       this.index(row);
       rows.push(row);
@@ -403,6 +414,11 @@ export class Store {
 
   markStored(id: number, messageId: number): Promise<void> {
     return this.patchPhoto(id, { status: 'stored', tg_message_id: messageId, last_error: null });
+  }
+
+  /** Getting a piece through shows the connection is working, so earlier failures stop counting against it. */
+  savePieces(id: number, pieces: StoredPiece[]): Promise<void> {
+    return this.patchPhoto(id, { tg_parts: pieces, attempts: 0 });
   }
 
   /** Puts a job back in line. `countAttempt` is false when the wait was not this photo's fault. */

@@ -1,6 +1,6 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { getEngine } from '../src/api';
-import { uploader } from '../src/lib/uploads';
+import { MAX_PHOTO_BYTES, uploader } from '../src/lib/uploads';
 import { Device, makeJpeg } from './helpers';
 
 vi.mock('../src/api', async () => {
@@ -20,6 +20,27 @@ describe('retrying selected uploads', () => {
     uploader.clearSettled(() => true);
     await device.close();
     vi.restoreAllMocks();
+  });
+
+  it('takes videos, recognising the ones a browser gives no type for by name', async () => {
+    vi.mocked(getEngine).mockRejectedValue(new Error('Not now'));
+    const named = new File(['x'], 'holiday.mkv');
+    const typed = new File(['x'], 'clip', { type: 'video/mp4' });
+    const other = new File(['x'], 'notes.txt', { type: 'text/plain' });
+    expect(uploader.add([named, typed, other])).toEqual({ added: 2, skipped: 1 });
+    await vi.waitFor(() => expect(uploader.isBusy).toBe(false));
+  });
+
+  it('refuses a photo over the Telegram limit straight away, but lets a video that size go on to be split', async () => {
+    vi.mocked(getEngine).mockRejectedValue(new Error('Not now'));
+    const sized = (file: File) => Object.defineProperty(file, 'size', { value: MAX_PHOTO_BYTES + 1 }) as File;
+    uploader.add([sized(new File(['x'], 'huge.jpg', { type: 'image/jpeg' })), sized(new File(['x'], 'huge.mp4', { type: 'video/mp4' }))]);
+    await vi.waitFor(() => expect(uploader.isBusy).toBe(false));
+    const [photo, video] = uploader.snapshot();
+    expect(photo).toMatchObject({ stage: 'error', file: null });
+    expect(photo!.error).toMatch(/1\.95 GB/);
+    // It got as far as asking the engine, which is what the mock turned away.
+    expect(video).toMatchObject({ stage: 'error', error: 'Not now' });
   });
 
   it('retries all 50 selected files after preparation fails', async () => {

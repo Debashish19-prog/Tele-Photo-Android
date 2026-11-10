@@ -9,7 +9,7 @@ import { useToast } from '@/components/ui/toast';
 import { useLocalUploads } from '@/hooks/useUploadStatus';
 import { formatBytes } from '@/lib/format';
 import { QUICK } from '@/lib/motion';
-import { type LocalUpload, uploader } from '@/lib/uploads';
+import { ACCEPTED_FILES, type LocalUpload, uploader } from '@/lib/uploads';
 
 const MAX_ROWS = 60;
 
@@ -58,7 +58,7 @@ export function UploadPanel({ status }: { status: UploadStatus | undefined }) {
       description: err instanceof Error ? err.message : 'Please try again.',
       type: 'error',
       ...(err instanceof ApiError && err.code === 'FILE_NEEDED'
-        ? { actionProps: { children: 'Choose photos', onClick: () => fileInput.current?.click() } }
+        ? { actionProps: { children: 'Choose files', onClick: () => fileInput.current?.click() } }
         : {}),
     });
     refresh();
@@ -147,10 +147,10 @@ export function UploadPanel({ status }: { status: UploadStatus | undefined }) {
   const title = scanning
     ? `Restoring from Telegram · ${(status?.scan.added ?? 0).toLocaleString()} found`
     : active > 0
-      ? `Uploading ${active.toLocaleString()} ${active === 1 ? 'photo' : 'photos'}`
+      ? `Uploading ${active.toLocaleString()} ${active === 1 ? 'file' : 'files'}`
       : failed > 0
-        ? `${failed.toLocaleString()} ${failed === 1 ? 'photo needs' : 'photos need'} attention`
-        : `${finished.toLocaleString()} ${finished === 1 ? 'photo' : 'photos'} done`;
+        ? `${failed.toLocaleString()} ${failed === 1 ? 'file needs' : 'files need'} attention`
+        : `${finished.toLocaleString()} ${finished === 1 ? 'file' : 'files'} done`;
 
   return (
     <AnimatePresence>
@@ -173,8 +173,8 @@ export function UploadPanel({ status }: { status: UploadStatus | undefined }) {
           type="file"
           multiple
           hidden
-          aria-label="Choose original photos to retry"
-          accept="image/*,.heic,.heif,.dng,.cr2,.cr3,.nef,.arw,.orf,.rw2,.raf,.pef,.srw"
+          aria-label="Choose the original files to retry"
+          accept={ACCEPTED_FILES}
           onChange={(event) => {
             uploader.add([...(event.target.files ?? [])], null, { retryOnly: true });
             event.target.value = '';
@@ -228,7 +228,7 @@ export function UploadPanel({ status }: { status: UploadStatus | undefined }) {
                     ) : null}
                   </div>
                   {row.onRetry ? (
-                    <button type="button" aria-label={`Retry ${row.filename}`} title={row.needsFile ? 'Choose the original photo to retry' : 'Retry upload'} className="grid size-7 flex-none cursor-pointer place-items-center rounded-full hover:bg-[var(--lq-highlight)]" onClick={row.onRetry}>
+                    <button type="button" aria-label={`Retry ${row.filename}`} title={row.needsFile ? 'Choose the original file to retry' : 'Retry upload'} className="grid size-7 flex-none cursor-pointer place-items-center rounded-full hover:bg-[var(--lq-highlight)]" onClick={row.onRetry}>
                       <RotateCw className="size-3.5" aria-hidden="true" />
                     </button>
                   ) : null}
@@ -245,7 +245,7 @@ export function UploadPanel({ status }: { status: UploadStatus | undefined }) {
             </ul>
             {retryable > 1 || needsFiles ? (
               <div className="border-t border-[var(--app-line)] px-4 py-2 text-[11.5px] text-[var(--lq-text-dim)]">
-                {needsFiles && !autoBackup.handlesRetries() ? <p>Select the original photos again to retry. You can select the whole batch; saved photos will be skipped.</p> : null}
+                {needsFiles && !autoBackup.handlesRetries() ? <p>Select the original files again to retry. You can select the whole batch; saved files will be skipped.</p> : null}
                 {retryable > 1 ? (
                   <button type="button" className="mt-1 cursor-pointer font-semibold text-[var(--lq-accent)]" onClick={retryAll}>Retry all failed uploads</button>
                 ) : null}
@@ -253,7 +253,7 @@ export function UploadPanel({ status }: { status: UploadStatus | undefined }) {
             ) : null}
             {active > 0 ? (
               <p className="border-t border-[var(--app-line)] px-4 py-2 text-[11.5px] text-[var(--lq-text-dim)]">
-                {autoBackup.available ? 'Your photos go straight to Telegram from this phone.' : 'Keep this tab open until everything has reached Telegram. Your photos go straight there from this device.'}
+                {autoBackup.available ? 'Your files go straight to Telegram from this phone.' : 'Keep this tab open until everything has reached Telegram. Your files go straight there from this device.'}
               </p>
             ) : null}
           </motion.div>
