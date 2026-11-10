@@ -1,4 +1,12 @@
 # Android Studio keeps its own Java and SDK, and often neither is on PATH.
+if [ -z "${JAVA_HOME:-}" ]; then
+  for candidate in "$HOME/Applications/android-studio/jbr" "$HOME/android-studio/jbr" /opt/android-studio/jbr "$HOME/Android Studio"/*/android-studio/jbr; do
+    if [ -x "$candidate/bin/java" ]; then
+      JAVA_HOME="$candidate"
+      break
+    fi
+  done
+fi
 : "${JAVA_HOME:=$HOME/Applications/android-studio/jbr}"
 : "${ANDROID_HOME:=$HOME/Android/Sdk}"
 if [ ! -x "$JAVA_HOME/bin/java" ]; then

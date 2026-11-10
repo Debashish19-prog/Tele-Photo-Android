@@ -1,9 +1,10 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+import { type AndroidBridge, androidGallery, GalleryFile } from '../src/engine/android';
 import {
   AutoSync, type AutoSyncStatus, type GalleryAccess, type GalleryHost, type GalleryItem, GalleryLedger, GalleryReadError, type NetworkState, type PassOutcome,
 } from '../src/engine/autosync';
 import { RateLimitedError, SessionRevokedError } from '../src/engine/types';
-import { blobBytes, Device, makeJpeg, sha256 } from './helpers';
+import { blobBytes, Device, makeJpeg, makeMp4, sha256 } from './helpers';
 
 const LONG_AGO = 1_700_000_000;
 let ledgerCount = 0;
@@ -24,7 +25,8 @@ class FakeGallery implements GalleryHost {
 
   add(bytes: Uint8Array, name = `IMG_${this.nextId}.jpg`, modified = LONG_AGO): number {
     const id = this.nextId++;
-    this.files.set(id, { item: { id, name, size: bytes.length, modified, taken: null }, bytes });
+    const kind = /\.(mp4|mov)$/i.test(name) ? 'video' : 'photo';
+    this.files.set(id, { item: { id, name, size: bytes.length, modified, taken: null, kind }, bytes });
     return id;
   }
 
@@ -140,6 +142,207 @@ describe('automatic gallery backup', () => {
       const row = stored()[0]!;
       expect(row.sha256).toBe(sha256(bytes));
       expect(row.preview_state).toBe('unavailable');
+    });
+  });
+
+  describe('videos', () => {
+    afterEach(() => {
+      vi.unstubAllGlobals();
+    });
+
+    /**
+     * Reads go through android.ts to a pretend WebAssets.kt, as on the phone, instead of being handed
+     * over whole. Returns every request made, which `onRequest` sees first, before it is answered.
+     */
+    const readFromPhone = (onRequest: (url: string) => void = () => undefined): string[] => {
+      const requests: string[] = [];
+      vi.stubGlobal('fetch', async (input: string) => {
+        requests.push(input);
+        onRequest(input);
+        const url = new URL(input, 'https://appassets.androidplatform.net');
+        const file = gallery.files.get(Number(url.pathname.replace('/_gallery/', '')));
+        if (!file || url.searchParams.has('poster')) return new Response(null, { status: 404 });
+        const version = `${file.bytes.length}-${file.item.modified}`;
+        const headers = { 'X-Tele-Photo-Size': String(file.bytes.length), 'X-Tele-Photo-Version': version };
+        const expected = url.searchParams.get('version');
+        if (expected !== null && expected !== version) return new Response(null, { status: 409 });
+        if (!url.searchParams.has('start')) return new Response(file.bytes as BodyInit, { headers });
+        const [start, end] = [Number(url.searchParams.get('start')), Number(url.searchParams.get('end'))];
+        if (end > file.bytes.length) return new Response(null, { status: 416 });
+        return new Response(file.bytes.slice(start, end) as BodyInit, { headers });
+      });
+      const phone = androidGallery({} as AndroidBridge);
+      gallery.read = async (item) => {
+        gallery.reads.push(item.id);
+        return phone.read(item);
+      };
+      return requests;
+    };
+    const asked = (request: string) => new URLSearchParams(request.split('?')[1] ?? '');
+
+    it('reads a video straight from the phone a piece at a time, never the whole of it at once', async () => {
+      const requests = readFromPhone();
+      const video = makeMp4({ size: 20 * 1024 * 1024, seed: 12 });
+      gallery.add(video, 'VID_direct.mp4');
+
+      expect(await pass()).toMatchObject({ phase: 'idle', remaining: 0 });
+
+      const row = d.engine.store.getPhotoBySha(sha256(video))!;
+      expect(row).toMatchObject({ status: 'stored', size: video.length, mime: 'video/mp4' });
+      d.engine.queue.detach(row.id);
+      expect(sha256(await inTelegram(row.id))).toBe(sha256(video));
+      const reads = requests.filter((r) => !asked(r).has('poster'));
+      expect(reads.filter((r) => !asked(r).has('start'))).toEqual([]);
+      const largest = Math.max(...reads.map((r) => Number(asked(r).get('end')) - Number(asked(r).get('start'))));
+      expect(largest).toBeLessThanOrEqual(8 * 1024 * 1024);
+      // Each one says which version it expects, apart from the first, which is how it learns that.
+      expect(reads.slice(1).every((r) => asked(r).has('version'))).toBe(true);
+    });
+
+    it('still reads a photo whole, as its thumbnail needs all of it', async () => {
+      const requests = readFromPhone();
+      const photo = makeJpeg({ color: '#v3' });
+      gallery.add(photo);
+      await pass();
+      expect(requests).toEqual(['/_gallery/1']);
+      expect(d.engine.store.getPhotoBySha(sha256(photo))?.status).toBe('stored');
+    });
+
+    it('backs up the new version if a video is edited while it is being read', async () => {
+      const first = makeMp4({ size: 20 * 1024 * 1024, seed: 13 });
+      const second = makeMp4({ size: 20 * 1024 * 1024 + 7, seed: 14 });
+      let id = 0;
+      const requests = readFromPhone(() => {
+        if (requests.length === 3) gallery.edit(id, second);
+      });
+      id = gallery.add(first, 'VID_edit.mp4');
+
+      expect(await pass()).toMatchObject({ phase: 'idle', remaining: 0 });
+
+      expect(requests.some((r) => asked(r).has('version'))).toBe(true);
+      expect(d.engine.store.getPhotoBySha(sha256(first))).toBeUndefined();
+      const row = d.engine.store.getPhotoBySha(sha256(second))!;
+      expect(row.status).toBe('stored');
+      d.engine.queue.detach(row.id);
+      expect(sha256(await inTelegram(row.id))).toBe(sha256(second));
+    });
+
+    it('backs up the new version if a video is edited while it is going up, and never mixes the two', async () => {
+      readFromPhone();
+      const first = makeMp4({ size: 6000, seed: 15 });
+      const second = makeMp4({ size: 6500, seed: 16 });
+      const id = gallery.add(first, 'VID_edit2.mp4');
+      d.storage.onPut = () => {
+        d.storage.onPut = null;
+        gallery.edit(id, second);
+      };
+
+      expect(await pass()).toMatchObject({ phase: 'idle', remaining: 0 });
+
+      const row = d.engine.store.getPhotoBySha(sha256(second))!;
+      expect(row.status).toBe('stored');
+      d.engine.queue.detach(row.id);
+      expect(sha256(await inTelegram(row.id))).toBe(sha256(second));
+      // The first version never reached Telegram, and says why.
+      expect(d.engine.store.getPhotoBySha(sha256(first))).toMatchObject({ status: 'failed', tg_message_id: null });
+      expect(d.engine.store.getPhotoBySha(sha256(first))!.last_error).toContain('changed');
+    });
+
+    it('gives up on a video that is deleted from the phone partway, without storing part of it', async () => {
+      const video = makeMp4({ size: 20 * 1024 * 1024, seed: 17 });
+      let id = 0;
+      const requests = readFromPhone(() => {
+        if (requests.length === 3) gallery.files.delete(id);
+      });
+      id = gallery.add(video, 'VID_gone.mp4');
+
+      await pass();
+
+      expect(d.engine.store.allPhotos()).toHaveLength(0);
+      expect(sync.status().total).toBe(0);
+    });
+
+    it('slices exactly as a Blob does, from either end', async () => {
+      readFromPhone();
+      const bytes = makeMp4({ size: 5000, seed: 18 });
+      const id = gallery.add(bytes, 'VID_slice.mp4');
+      const file = new GalleryFile({ id, size: bytes.length, version: `${bytes.length}-${LONG_AGO}` });
+      const real = new Blob([bytes as BlobPart]);
+      const cases: [number | undefined, number | undefined][] = [[undefined, undefined], [0, 10], [10, 4], [-100, undefined], [-100, -20], [4000, 99_999]];
+      for (const [start, end] of cases) {
+        const ours = file.slice(start, end);
+        expect(ours.size).toBe(real.slice(start, end).size);
+        expect(new Uint8Array(await ours.arrayBuffer())).toEqual(new Uint8Array(await real.slice(start, end).arrayBuffer()));
+        expect(new Uint8Array(await ours.slice(1, -1).arrayBuffer())).toEqual(new Uint8Array(await real.slice(start, end).slice(1, -1).arrayBuffer()));
+      }
+    });
+
+    it('backs up a video from the gallery with exactly its bytes, alongside the photos', async () => {
+      const photo = makeJpeg({ color: '#v1' });
+      const video = makeMp4({ size: 4000, seed: 7 });
+      gallery.add(photo);
+      gallery.add(video, 'VID_20240101_120000.mp4');
+
+      expect(await pass()).toMatchObject({ phase: 'idle', remaining: 0 });
+
+      const row = d.engine.store.getPhotoBySha(sha256(video))!;
+      expect(row).toMatchObject({ status: 'stored', mime: 'video/mp4', size: video.length, tg_parts: null });
+      d.engine.queue.detach(row.id);
+      expect(sha256(await inTelegram(row.id))).toBe(sha256(video));
+      expect(d.engine.store.getPhotoBySha(sha256(photo))?.status).toBe('stored');
+    });
+
+    it('sends a video too large for one message in pieces, and the same bytes come back', async () => {
+      await sync.settled();
+      ledger.close();
+      await d.close();
+      d = await new Device().open({ split: { maxSingleBytes: 5000, pieceBytes: 3000 } });
+      await d.signIn();
+      await start();
+      const video = makeMp4({ size: 8000, seed: 8 });
+      gallery.add(video, 'VID_long.mp4');
+
+      expect(await pass()).toMatchObject({ phase: 'idle', remaining: 0 });
+
+      const row = d.engine.store.getPhotoBySha(sha256(video))!;
+      expect(row.status).toBe('stored');
+      expect(row.tg_parts).toHaveLength(3);
+      d.engine.queue.detach(row.id);
+      expect(sha256(await inTelegram(row.id))).toBe(sha256(video));
+    });
+
+    it('notes that it is reading a file before it starts, in case reading it is what takes the page down', async () => {
+      const video = makeMp4({ size: 3000, seed: 10 });
+      const id = gallery.add(video, 'VID_read.mp4');
+      let duringRead: number | undefined;
+      gallery.onRead = (readId) => {
+        if (readId === id) duringRead = ledger.get(id)?.preparing;
+      };
+
+      await pass();
+
+      expect(duringRead).toBe(1);
+      expect(ledger.get(id)).toMatchObject({ state: 'done', preparing: 0 });
+    });
+
+    it('sets aside a file that keeps taking the page down, so the rest of the gallery still gets done', async () => {
+      // The first pass claims the ledger for this account, which would clear what is planted below.
+      await pass();
+      const photo = makeJpeg({ color: '#v2' });
+      gallery.add(photo);
+      // The newest, so it would be first in line every time.
+      const video = makeMp4({ size: 3000, seed: 11 });
+      const stuck = gallery.add(video, 'VID_stuck.mp4');
+      await ledger.put({ id: stuck, modified: LONG_AGO, size: video.length, state: 'retry', sha256: null, reason: null, attempts: 0, nextTry: 0, preparing: 4 });
+
+      const outcome = await pass();
+
+      expect(gallery.reads).not.toContain(stuck);
+      expect(d.engine.store.getPhotoBySha(sha256(photo))?.status).toBe('stored');
+      const row = ledger.get(stuck)!;
+      expect(row).toMatchObject({ state: 'retry', preparing: 0, attempts: 1 });
+      expect(outcome).toMatchObject({ phase: 'idle', resumeAt: row.nextTry });
+      expect(sync.status().failing).toBe(1);
     });
   });
 

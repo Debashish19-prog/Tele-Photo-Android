@@ -4,11 +4,15 @@ import android.annotation.SuppressLint
 import android.app.Activity
 import android.content.ActivityNotFoundException
 import android.content.Intent
+import android.graphics.Color
 import android.net.Uri
 import android.os.Build
 import android.os.Bundle
 import android.provider.Settings
+import android.view.View
+import android.view.ViewGroup
 import android.view.WindowInsets
+import android.view.WindowInsetsController
 import android.webkit.WebChromeClient
 import android.window.OnBackInvokedCallback
 import android.window.OnBackInvokedDispatcher
@@ -19,6 +23,8 @@ import android.widget.Toast
 class MainActivity : Activity() {
     private lateinit var root: FrameLayout
     private var backCallback: Any? = null
+    private var fullscreen: View? = null
+    private var fullscreenCallback: WebChromeClient.CustomViewCallback? = null
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -49,6 +55,7 @@ class MainActivity : Activity() {
     }
 
     override fun onDestroy() {
+        hideFullscreen(tellPage = true)
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
             (backCallback as? OnBackInvokedCallback)?.let { onBackInvokedDispatcher.unregisterOnBackInvokedCallback(it) }
         }
@@ -63,7 +70,49 @@ class MainActivity : Activity() {
 
     /** Leaving by Back keeps the app in memory, so coming back to it is instant. */
     private fun goBack() {
+        if (fullscreen != null) {
+            hideFullscreen(tellPage = true)
+            return
+        }
         EngineHost.back { moveTaskToBack(true) }
+    }
+
+    /** A video filling the screen, over everything, with the system bars out of the way until swiped in. */
+    fun showFullscreen(view: View, callback: WebChromeClient.CustomViewCallback) {
+        hideFullscreen(tellPage = true)
+        fullscreen = view
+        fullscreenCallback = callback
+        view.setBackgroundColor(Color.BLACK)
+        (window.decorView as ViewGroup).addView(view, FrameLayout.LayoutParams(FrameLayout.LayoutParams.MATCH_PARENT, FrameLayout.LayoutParams.MATCH_PARENT))
+        systemBars(show = false)
+    }
+
+    /** @param tellPage false when the page has left fullscreen itself and is only saying so. */
+    fun hideFullscreen(tellPage: Boolean) {
+        val view = fullscreen ?: return
+        val callback = fullscreenCallback
+        // Cleared first, as telling the page makes WebView call back into this.
+        fullscreen = null
+        fullscreenCallback = null
+        (window.decorView as ViewGroup).removeView(view)
+        systemBars(show = true)
+        if (tellPage) callback?.onCustomViewHidden()
+    }
+
+    private fun systemBars(show: Boolean) {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+            val controller = window.insetsController ?: return
+            if (show) {
+                controller.show(WindowInsets.Type.systemBars())
+            } else {
+                controller.systemBarsBehavior = WindowInsetsController.BEHAVIOR_SHOW_TRANSIENT_BARS_BY_SWIPE
+                controller.hide(WindowInsets.Type.systemBars())
+            }
+        } else {
+            @Suppress("DEPRECATION") // Android 10 has no other way.
+            window.decorView.systemUiVisibility = if (show) View.SYSTEM_UI_FLAG_VISIBLE else
+                View.SYSTEM_UI_FLAG_FULLSCREEN or View.SYSTEM_UI_FLAG_HIDE_NAVIGATION or View.SYSTEM_UI_FLAG_IMMERSIVE_STICKY
+        }
     }
 
     fun requestGalleryAccess() {
@@ -93,7 +142,13 @@ class MainActivity : Activity() {
     }
 
     fun showFileChooser(params: WebChromeClient.FileChooserParams) {
+        // createIntent() keeps only the first accepted type, which would leave out videos. Extensions such as .heic are covered by image/* already.
+        val types = params.acceptTypes.flatMap { it.split(',') }.map { it.trim().lowercase() }.filter { '/' in it }.distinct()
         val intent = params.createIntent().apply {
+            if (types.size > 1) {
+                type = "*/*"
+                putExtra(Intent.EXTRA_MIME_TYPES, types.toTypedArray())
+            }
             if (params.mode == WebChromeClient.FileChooserParams.MODE_OPEN_MULTIPLE) putExtra(Intent.EXTRA_ALLOW_MULTIPLE, true)
         }
         try {

@@ -13,6 +13,8 @@ import android.util.Log
 import android.view.ContextThemeWrapper
 import android.view.View
 import android.webkit.RenderProcessGoneDetail
+import android.webkit.ServiceWorkerClient
+import android.webkit.ServiceWorkerController
 import android.webkit.ValueCallback
 import android.webkit.WebChromeClient
 import android.webkit.WebResourceRequest
@@ -78,6 +80,7 @@ object EngineHost {
 
         val debuggable = appContext.applicationInfo.flags and ApplicationInfo.FLAG_DEBUGGABLE != 0
         WebView.setWebContentsDebuggingEnabled(debuggable)
+        serveWorkers()
 
         val base = MutableContextWrapper(themed())
         val view = WebView(base)
@@ -102,6 +105,27 @@ object EngineHost {
         webView = view
         lastHeard = SystemClock.elapsedRealtime()
         return view
+    }
+
+    private var workersServed = false
+
+    /**
+     * Videos play through a service worker (media-sw.js). Android hands a worker's own requests,
+     * starting with its script, to this client rather than to the WebView's, so without it the
+     * worker never starts. They are served exactly as the page's are, so it makes no difference
+     * which of the two a request reaches. Set before the first load, as a worker registered last
+     * time takes over at once.
+     */
+    private fun serveWorkers() {
+        if (workersServed) return
+        workersServed = true
+        val controller = ServiceWorkerController.getInstance()
+        controller.serviceWorkerWebSettings.allowFileAccess = false
+        controller.serviceWorkerWebSettings.allowContentAccess = false
+        controller.setServiceWorkerClient(object : ServiceWorkerClient() {
+            override fun shouldInterceptRequest(request: WebResourceRequest): WebResourceResponse? =
+                WebAssets.respond(appContext, request)
+        })
     }
 
     /** The theme is how the page learns light or dark, so it has to be there with no screen open too. */
@@ -317,6 +341,16 @@ object EngineHost {
             filePathCallback = callback
             screen.showFileChooser(params)
             return true
+        }
+
+        /** A video's own fullscreen button. Without this, WebView ignores it. */
+        override fun onShowCustomView(view: View, callback: CustomViewCallback) {
+            val screen = activity
+            if (screen == null) callback.onCustomViewHidden() else screen.showFullscreen(view, callback)
+        }
+
+        override fun onHideCustomView() {
+            activity?.hideFullscreen(tellPage = false)
         }
     }
 }

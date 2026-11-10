@@ -27,8 +27,8 @@ function minutesUntil(at: number | null): string {
 
 /** One sentence saying where things stand, which the banner and the dialog both show. */
 export function describe(state: AutoBackupState): string {
-  const left = formatCount(state.remaining + state.failing, 'photo');
-  // It may have stopped before counting anything, and "0 photos left" would read as finished.
+  const left = formatCount(state.remaining + state.failing, 'item');
+  // It may have stopped before counting anything, and "0 items left" would read as finished.
   const stillLeft = state.remaining + state.failing > 0 ? ` ${left} left.` : '';
   switch (state.phase) {
     case 'off':
@@ -36,11 +36,11 @@ export function describe(state: AutoBackupState): string {
     case 'signed-out':
       return 'Sign in to back up this phone.';
     case 'no-access':
-      return 'Auto backup needs access to your photos.';
+      return 'Auto backup needs access to your photos and videos.';
     case 'needs-sign-in':
       return 'Telegram ended this session. Sign in again to continue.';
     case 'checking':
-      return 'Looking for new photos…';
+      return 'Looking for new photos and videos…';
     case 'backing-up':
       return `Backing up. ${state.done.toLocaleString()} of ${state.total.toLocaleString()} done.`;
     case 'waiting-network':
@@ -54,7 +54,7 @@ export function describe(state: AutoBackupState): string {
     case 'paused':
       return `Android paused the backup for now.${stillLeft}`;
     case 'idle':
-      return state.failing > 0 ? `${left} could not be saved, and will be tried again.` : 'Every photo on this phone is backed up.';
+      return state.failing > 0 ? `${left} could not be saved, and will be tried again.` : 'Every photo and video on this phone is backed up.';
   }
 }
 
@@ -110,7 +110,7 @@ export function AutoBackupBanner({ needsSignIn }: { needsSignIn: boolean }) {
         }
       >
         <p className="font-semibold">Back up this phone automatically</p>
-        <p className="text-[12.5px] text-[var(--lq-text-dim)]">Every photo in your gallery goes to your Telegram as the original file.</p>
+        <p className="text-[12.5px] text-[var(--lq-text-dim)]">Every photo and video in your gallery goes to your Telegram as the original file.</p>
       </Strip>
     );
   }
@@ -118,16 +118,16 @@ export function AutoBackupBanner({ needsSignIn }: { needsSignIn: boolean }) {
   if (state.access === 'none') {
     return (
       <Strip icon={<Image className="size-5" aria-hidden="true" />} action={<Button size="sm" variant="accent" onClick={() => autoBackup.requestAccess()}>Allow</Button>}>
-        <p className="font-semibold">Auto backup needs access to your photos</p>
-        <p className="text-[12.5px] text-[var(--lq-text-dim)]">Choose "Allow all". If Android no longer asks, turn on Photos in the app's settings.</p>
+        <p className="font-semibold">Auto backup needs access to your photos and videos</p>
+        <p className="text-[12.5px] text-[var(--lq-text-dim)]">Choose "Allow all". If Android no longer asks, turn on Photos and videos in the app's settings.</p>
       </Strip>
     );
   }
 
   const partial = state.access === 'partial' ? (
     <Strip icon={<Image className="size-5" aria-hidden="true" />} action={<Button size="sm" variant="accent" onClick={() => autoBackup.requestAccess()}>Allow all</Button>}>
-      <p className="font-semibold">Only the photos you selected are being backed up</p>
-      <p className="text-[12.5px] text-[var(--lq-text-dim)]">Allow all photos to back up the whole gallery.</p>
+      <p className="font-semibold">Only the photos and videos you selected are being backed up</p>
+      <p className="text-[12.5px] text-[var(--lq-text-dim)]">Allow all of them to back up the whole gallery.</p>
     </Strip>
   ) : null;
 
@@ -178,7 +178,7 @@ export function AutoBackupDialog({ open, onClose }: { open: boolean; onClose: ()
               <Row
                 icon={<CloudUpload className="size-5" aria-hidden="true" />}
                 title="Back up this phone"
-                detail="New photos go to Telegram by themselves"
+                detail="New photos and videos go to Telegram by themselves"
                 control={
                   <Toggle aria-label="Back up this phone" pressed={state.enabled} onPressedChange={(on) => void (on ? autoBackup.turnOn() : autoBackup.turnOff()).then(refresh)}>
                     {state.enabled ? 'On' : 'Off'}
@@ -206,7 +206,7 @@ export function AutoBackupDialog({ open, onClose }: { open: boolean; onClose: ()
               {state.enabled && state.access !== 'all' ? (
                 <Row
                   icon={<Image className="size-5" aria-hidden="true" />}
-                  title={state.access === 'partial' ? 'Only selected photos' : 'No access to photos'}
+                  title={state.access === 'partial' ? 'Only selected photos and videos' : 'No access to photos and videos'}
                   detail='Choose "Allow all" so that the whole gallery is backed up'
                   control={<Button size="sm" variant="accent" onClick={() => autoBackup.openAppSettings()}>Settings</Button>}
                 />
@@ -230,7 +230,7 @@ export function AutoBackupDialog({ open, onClose }: { open: boolean; onClose: ()
             ) : null}
             {state.failing > 0 ? <Button className="mt-3" size="sm" variant="glass" onClick={() => void autoBackup.retryNow().then(refresh)}>Try again now</Button> : null}
             <p className="mt-3 text-[12px] text-[var(--lq-text-dim)]">
-              Photos are sent as the original files, byte for byte, including their location. Removing a photo from this phone does not remove its backup, and a photo you delete in this app stays deleted. Videos are not backed up yet.
+              Photos and videos are sent as the original files, byte for byte, including their location. A video over 1.95 GB goes up in pieces, which the app joins again. Removing something from this phone does not remove its backup, and anything you delete in this app stays deleted.
             </p>
           </>
         ) : null}

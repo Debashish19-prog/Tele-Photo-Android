@@ -1,3 +1,15 @@
+/**
+ * Why a file on the phone could not be read. `changed` means it was edited while being read a
+ * piece at a time, so what was read so far belongs to a version that no longer exists.
+ */
+export type GalleryReadProblem = 'gone' | 'denied' | 'changed' | 'failed';
+
+export class GalleryReadError extends Error {
+  constructor(readonly problem: GalleryReadProblem, message: string) {
+    super(message);
+  }
+}
+
 export interface LibraryRef {
   channelId: string;
   accessHash: string;

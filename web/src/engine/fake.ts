@@ -1,3 +1,4 @@
+import { realBlob } from './media';
 import {
   type CodeResult,
   type EnsureLibraryResult,
@@ -159,7 +160,8 @@ export class FakeStorage implements StorageBackend {
     await this.disk.put(counter, messageId);
     const stored: StoredMessage = {
       messageId, filename: input.filename, size: input.size, mime: input.mime, caption: input.caption,
-      date: Math.floor(Date.now() / 1000), hasThumb: input.thumb !== null, file: input.file, thumb: input.thumb,
+      // As Telegram would, it takes the bytes now. Saving a video still on the phone as it is would save an empty file.
+      date: Math.floor(Date.now() / 1000), hasThumb: input.thumb !== null, file: await realBlob(input.file), thumb: input.thumb,
     };
     await this.disk.put(this.messageKey(ctx.session, messageId), stored);
     return { messageId };

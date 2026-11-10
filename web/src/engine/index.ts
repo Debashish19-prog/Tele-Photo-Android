@@ -1,6 +1,6 @@
 import { cleanFilename } from './caption';
 import { Library, type ScanState } from './library';
-import { browserMedia, hashBlob, mediaLimiter, type MediaTools } from './media';
+import { browserMedia, hashBlob, mediaLimiter, type MediaTools, realBlob } from './media';
 import { BlockCache, checkedAgainst, joinPieces, locateRange, piecesOf, planPieces, type SplitPolicy, TELEGRAM_SPLIT } from './pieces';
 import { collectBlob, INTERRUPTED_MESSAGE, PREVIEW_DOWNLOAD_LIMIT, UploadQueue } from './queue';
 import { StateSync } from './sync';
@@ -775,7 +775,8 @@ export class Engine {
   original(id: number): Promise<Blob> {
     const photo = this.owned(id);
     const local = this.queue.fileFor(id);
-    if (local) return Promise.resolve(local);
+    // Whoever asked may give it to the browser, which would see a video still on the phone as empty.
+    if (local) return realBlob(local);
 
     const recent = this.originals.get(id);
     if (recent) return Promise.resolve(recent);

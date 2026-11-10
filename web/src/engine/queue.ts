@@ -2,7 +2,7 @@ import { buildCaption } from './caption';
 import { mediaLimiter, type MediaTools } from './media';
 import { joinPieces, PIECE_MIME, pieceName, piecesOf, planPieces, type SplitPolicy, type StoredPiece } from './pieces';
 import type { PhotoRow, Store } from './store';
-import { RateLimitedError, SessionRevokedError, type StorageBackend, type StorageContext } from './types';
+import { GalleryReadError, RateLimitedError, SessionRevokedError, type StorageBackend, type StorageContext } from './types';
 
 const MAX_ATTEMPTS = 6;
 const POLL_MS = 5000;
@@ -243,6 +243,11 @@ export class UploadQueue {
       return;
     }
     const message = err instanceof Error ? err.message : String(err);
+    // A video read from the phone that has changed or gone will not read any better next time.
+    if (err instanceof GalleryReadError && err.problem !== 'failed') {
+      await store.markFailed(job.id, message);
+      return;
+    }
     const attempts = store.getPhoto(job.id)?.attempts ?? job.attempts;
     if (attempts + 1 >= MAX_ATTEMPTS) await store.markFailed(job.id, message);
     else await store.rescheduleUpload(job.id, Date.now() + 5000 * 2 ** attempts, message, true);

@@ -1,6 +1,8 @@
 import { toWallClock } from '../lib/format';
 import type { Engine } from './index';
-import { RateLimitedError, SessionRevokedError, UserFacingError } from './types';
+import { GalleryReadError, RateLimitedError, SessionRevokedError, UserFacingError } from './types';
+
+export { GalleryReadError, type GalleryReadProblem } from './types';
 
 /** How long a new file is left alone, in case whatever made it is still writing. */
 const SETTLE_MS = 10_000;
@@ -10,13 +12,18 @@ const LONG_WAIT_MS = 2 * 60_000;
 const POLL_MS = 1000;
 /** Tells the app shell this page is still alive, even during one long upload. */
 const HEARTBEAT_MS = 30_000;
-/** Several failures in a row means Telegram or the network is down, not that these photos are bad. */
+/** Several failures in a row means Telegram or the network is down, not that these files are bad. */
 const MAX_FAILURES_IN_A_ROW = 3;
 const OUTAGE_RETRY_MS = 15 * 60_000;
 const FIRST_RETRY_MS = 5 * 60_000;
 const LONGEST_RETRY_MS = 6 * 60 * 60_000;
-/** A photo that twice took the page down while being prepared is stored without a thumbnail. */
+/** A file that twice took the page down while being prepared is stored without a thumbnail. */
 const CRASHES_BEFORE_SKIPPING_PREVIEWS = 2;
+/**
+ * One that keeps doing so even then, as a video too large for the phone to read might, is left for
+ * a while. Otherwise it would be first in line every time, and nothing after it would get done.
+ */
+const CRASHES_BEFORE_SETTING_ASIDE = 4;
 /** Android sometimes lists a file that is no longer there. It gets another look now and then. */
 const MISSING_RETRY_MS = 24 * 60 * 60_000;
 const BLOCKED_KEY = 'blockedUntil';
@@ -31,18 +38,12 @@ export interface GalleryItem {
   modified: number;
   /** When it was taken, in milliseconds, if Android knows. */
   taken: number | null;
+  /** A video is read from the phone a piece at a time, as it is needed, rather than all at once. */
+  kind?: 'photo' | 'video';
 }
 
 export type GalleryAccess = 'all' | 'partial' | 'none';
 export type NetworkState = 'unmetered' | 'metered' | 'none';
-
-export type GalleryReadProblem = 'gone' | 'denied' | 'failed';
-
-export class GalleryReadError extends Error {
-  constructor(readonly problem: GalleryReadProblem, message: string) {
-    super(message);
-  }
-}
 
 export interface AutoSyncSettings {
   enabled: boolean;
@@ -55,7 +56,10 @@ export interface GalleryHost {
   settings(): AutoSyncSettings;
   network(): NetworkState;
   list(): Promise<GalleryItem[]>;
-  /** The file's exact bytes. Throws GalleryReadError rather than ever returning a modified copy. */
+  /**
+   * The file's exact bytes. Throws GalleryReadError rather than ever returning a modified copy. A
+   * video's may only be read later, as they are wanted, and its reads throw GalleryReadError too.
+   */
   read(item: GalleryItem): Promise<Blob>;
   report(status: AutoSyncStatus): void;
   finished(outcome: PassOutcome): void;
@@ -66,7 +70,7 @@ export type AutoSyncPhase =
   /** Turned off. */
   | 'off'
   | 'signed-out'
-  /** Needs photo access, including the part that keeps location in the originals. */
+  /** Needs access to photos and videos, including the part that keeps location in the originals. */
   | 'no-access'
   | 'needs-sign-in'
   | 'checking'
@@ -82,7 +86,7 @@ export type AutoSyncPhase =
 
 export interface AutoSyncStatus {
   phase: AutoSyncPhase;
-  /** Photos seen on the phone at the last check. */
+  /** Photos and videos seen on the phone at the last check. */
   total: number;
   /** Backed up, or deliberately left alone because the person removed them. */
   done: number;
@@ -220,7 +224,7 @@ const sleep = (ms: number) => new Promise<void>((resolve) => setTimeout(resolve,
 const EMPTY_STATUS: AutoSyncStatus = { phase: 'idle', total: 0, done: 0, refused: 0, failing: 0, remaining: 0, current: null, resumeAt: null, lastDoneAt: null };
 
 /**
- * Backs up the phone's gallery, one photo at a time, as the original files.
+ * Backs up the phone's gallery, photos and videos, one file at a time, as the original files.
  *
  * A file only counts as done once the engine says Telegram has it, and this is one-way: nothing
  * here ever deletes from the phone or from Telegram. If it is stopped at any point, the next pass
@@ -474,10 +478,13 @@ export class AutoSync {
       return 'retry';
     };
 
-    let file: Blob;
-    try {
-      file = await host.read(item);
-    } catch (err) {
+    if (preparing >= CRASHES_BEFORE_SETTING_ASIDE) return retryLater('This file stopped the app every time it was opened.');
+
+    // Saved first, so a crash while reading or decoding it is remembered, and cannot repeat for ever.
+    // A video can be gigabytes, so even reading it is something that might not survive.
+    await ledger.put(row({ preparing: preparing + 1 }));
+    /** A changed file is tried again, as the next look at the gallery sees it as a new version. */
+    const unreadable = async (err: unknown): Promise<BackupResult> => {
       const problem = err instanceof GalleryReadError ? err.problem : 'failed';
       if (problem === 'gone') {
         await ledger.put(row({ state: 'missing', nextTry: Date.now() + MISSING_RETRY_MS }));
@@ -485,15 +492,22 @@ export class AutoSync {
       }
       if (problem === 'denied') return 'denied';
       return retryLater(err instanceof Error ? err.message : 'This file could not be read.');
+    };
+
+    let file: Blob;
+    try {
+      file = await host.read(item);
+    } catch (err) {
+      return unreadable(err);
     }
 
-    // Saved first, so a crash while decoding it is remembered, and cannot repeat for ever.
-    await ledger.put(row({ preparing: preparing + 1 }));
     let result;
     try {
       const when = toWallClock(item.taken ?? item.modified * 1000);
       result = await engine.ingest(file, item.name, when, undefined, { autoSync: true, skipPreviews: preparing >= CRASHES_BEFORE_SKIPPING_PREVIEWS });
     } catch (err) {
+      // A video is read as it is hashed, so the phone can still refuse it, or it can change, by now.
+      if (err instanceof GalleryReadError) return unreadable(err);
       if (err instanceof UserFacingError) {
         if (err.status === 401) return 'reauth';
         // Could be a file something is still writing, so this one is worth another look.

@@ -54,6 +54,9 @@ object SyncScheduler {
                 .addTriggerContentUri(
                     JobInfo.TriggerContentUri(MediaStore.Images.Media.EXTERNAL_CONTENT_URI, JobInfo.TriggerContentUri.FLAG_NOTIFY_FOR_DESCENDANTS),
                 )
+                .addTriggerContentUri(
+                    JobInfo.TriggerContentUri(MediaStore.Video.Media.EXTERNAL_CONTENT_URI, JobInfo.TriggerContentUri.FLAG_NOTIFY_FOR_DESCENDANTS),
+                )
                 .setTriggerContentUpdateDelay(NEW_PHOTO_DELAY_MS)
                 .setTriggerContentMaxDelay(NEW_PHOTO_MAX_DELAY_MS)
                 .setRequiredNetworkType(networkFor(context))

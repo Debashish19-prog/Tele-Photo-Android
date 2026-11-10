@@ -74,6 +74,30 @@ export function createLimiter(max: number) {
 /** Thumbnails are CPU and memory heavy, so this is shared by everything that makes them. */
 export const mediaLimiter = createLimiter(2);
 
+/**
+ * A file that stays where it is, like a video in a phone's gallery, and is read a piece at a time
+ * through its own slice and arrayBuffer. A browser API handed one directly would see an empty file,
+ * so nothing here does that. See GalleryFile in android.ts.
+ */
+export interface PiecewiseFile extends Blob {
+  readonly piecewise: true;
+  /** A still from the video made by whatever holds the file, with the video's own size, which the still may be smaller than. */
+  poster(edge: number): Promise<{ image: Blob; width: number; height: number } | null>;
+}
+
+export const isPiecewise = (file: Blob): file is PiecewiseFile => (file as Partial<PiecewiseFile>).piecewise === true;
+
+/**
+ * A real Blob of the same bytes, for anything that hands a file to the browser itself. Gathered in
+ * pieces, which a browser can keep on disk, rather than as one buffer.
+ */
+export async function realBlob(file: Blob): Promise<Blob> {
+  if (!isPiecewise(file)) return file;
+  const parts: Blob[] = [];
+  for (let at = 0; at < file.size; at += HASH_CHUNK_BYTES) parts.push(new Blob([await file.slice(at, at + HASH_CHUNK_BYTES).arrayBuffer()]));
+  return new Blob(parts, { type: file.type });
+}
+
 /** Reads a piece at a time, so a 2 GB file never has to fit in memory. */
 export async function hashBlob(file: Blob, onProgress?: (fraction: number) => void): Promise<string> {
   const hasher = await createSHA256();
@@ -295,12 +319,14 @@ async function decode(file: Blob, mime: string): Promise<ImageBitmap | null> {
  * stored in Telegram regardless and gets a placeholder tile.
  */
 export async function makePreviews(file: Blob, mime: string): Promise<Previews | null> {
-  const bitmap = await decode(file, mime);
+  const still = isPiecewise(file) ? await file.poster(PREVIEW_EDGE).catch(() => null) : null;
+  // Only a still will do for a piecewise file: anything that decodes a file itself would see an empty one.
+  const bitmap = isPiecewise(file) ? (still ? await createImageBitmap(still.image).catch(() => null) : null) : await decode(file, mime);
   if (!bitmap) return null;
   try {
-    const { width, height } = bitmap;
-    const preview = await encodeWeb(bitmap, fitInside(width, height, PREVIEW_EDGE, PREVIEW_EDGE), 0.84);
-    const thumb = await encodeWeb(bitmap, fitInside(width, height, THUMB_MAX_WIDTH, THUMB_HEIGHT), 0.74);
+    const { width, height } = still ? fullSize(still, bitmap) : bitmap;
+    const preview = await encodeWeb(bitmap, fitInside(bitmap.width, bitmap.height, PREVIEW_EDGE, PREVIEW_EDGE), 0.84);
+    const thumb = await encodeWeb(bitmap, fitInside(bitmap.width, bitmap.height, THUMB_MAX_WIDTH, THUMB_HEIGHT), 0.74);
     const telegramThumb = await encodeTelegramThumb(bitmap);
     return { width, height, thumb, preview, telegramThumb };
   } catch {
@@ -308,6 +334,14 @@ export async function makePreviews(file: Blob, mime: string): Promise<Previews |
   } finally {
     bitmap.close();
   }
+}
+
+/** A video's own size, turned to match its still, which the phone has already turned the right way up. */
+function fullSize(still: { width: number; height: number }, bitmap: ImageBitmap): { width: number; height: number } {
+  if (!(still.width > 0 && still.height > 0)) return bitmap;
+  const long = Math.max(still.width, still.height);
+  const short = Math.min(still.width, still.height);
+  return bitmap.height > bitmap.width ? { width: short, height: long } : { width: long, height: short };
 }
 
 export const browserMedia: MediaTools = { sniffMedia, readMetadata, makePreviews };

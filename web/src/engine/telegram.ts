@@ -527,7 +527,8 @@ export class TelegramStorage implements StorageBackend {
 
   /** Telegram only serves whole blocks from aligned offsets, so this fetches those and trims the ends. */
   async getPhotoRange(ctx: StorageContext, messageId: number, start: number, end: number): Promise<Uint8Array> {
-    return guard(async () => {
+    // A few blocks at most, so it is timed as a whole. Otherwise a dropped connection leaves the video waiting for ever.
+    return this.request(ctx.session, async () => {
       const client = await this.client(ctx.session);
       const first = Math.floor(start / DOWNLOAD_REQUEST_BYTES);
       const last = Math.ceil(end / DOWNLOAD_REQUEST_BYTES);

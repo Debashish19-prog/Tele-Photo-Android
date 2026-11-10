@@ -40,16 +40,16 @@ object SyncNotifications {
         val total = done + remaining + failing
         val builder = Notification.Builder(context, CHANNEL_PROGRESS)
             .setSmallIcon(R.drawable.ic_notification)
-            .setContentTitle("Backing up your photos")
+            .setContentTitle("Backing up your gallery")
             .setContentIntent(openApp(context))
             .setOngoing(true)
             .setOnlyAlertOnce(true)
-        // A quick look for new photos is over before this would be worth showing.
+        // A quick look for anything new is over before this would be worth showing.
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) builder.setForegroundServiceBehavior(Notification.FOREGROUND_SERVICE_DEFERRED)
         if (total > 0) {
             builder.setContentText("$done of $total").setProgress(total, done, false)
         } else {
-            builder.setContentText("Looking for new photos").setProgress(0, 0, true)
+            builder.setContentText("Looking for new photos and videos").setProgress(0, 0, true)
         }
         return builder.build()
     }
@@ -62,7 +62,7 @@ object SyncNotifications {
     fun pass(context: Context, phase: String) {
         val text = when (phase) {
             "needs-sign-in" -> "Telegram ended this session. Open the app and sign in again to keep backing up."
-            "no-access" -> "Tele-Photo can no longer read your photos. Open the app to allow it again."
+            "no-access" -> "Tele-Photo can no longer read your photos and videos. Open the app to allow it again."
             else -> {
                 manager(context).cancel(ID_ATTENTION)
                 return

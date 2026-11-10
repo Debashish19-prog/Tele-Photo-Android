@@ -888,5 +888,69 @@ describe('videos in the library', () => {
         await expect(done).resolves.toBeUndefined();
       });
     });
+
+    describe('downloading in the Android app', () => {
+      /** What the app's side was handed, as Bridge.kt would write it to Downloads. */
+      let saved: { name: string; mime: string; chunks: Uint8Array[]; finished: boolean | null; begun: number };
+
+      beforeEach(() => {
+        saved = { name: '', mime: '', chunks: [], finished: null, begun: 0 };
+        vi.stubGlobal('window', {
+          TelePhotoAndroid: {
+            beginSave: (name: string, mime: string) => {
+              saved = { ...saved, name, mime, begun: saved.begun + 1 };
+              return 1;
+            },
+            writeSave: (_handle: number, base64: string) => {
+              saved.chunks.push(new Uint8Array(Buffer.from(base64, 'base64')));
+              return true;
+            },
+            finishSave: (_handle: number, ok: boolean) => {
+              saved.finished = ok;
+              return ok;
+            },
+          },
+        });
+      });
+
+      const savedBytes = () => new Uint8Array(Buffer.concat(saved.chunks));
+      const bigEnough = (photoId: number) => {
+        e().store.getPhoto(photoId)!.size = 300 * 1024 * 1024;
+      };
+
+      it('streams a large video into Downloads through the app, and never through the worker', async () => {
+        const id = await d.stored(original, 'clip.mp4');
+        bigEnough(id);
+        await downloadOriginals(e(), [id]);
+        // A WebView drops a download the worker starts, and that would look the same as one that finished.
+        expect(frames).toHaveLength(0);
+        expect(saved).toMatchObject({ name: 'clip.mp4', mime: 'video/mp4', finished: true, begun: 1 });
+        expect(sha256(savedBytes())).toBe(sha256(original));
+      });
+
+      it('saves a small photo the same way', async () => {
+        const photo = makeJpeg({ color: '#a1' });
+        const id = await d.stored(photo, 'IMG_1.jpg');
+        await downloadOriginals(e(), [id]);
+        expect(saved).toMatchObject({ name: 'IMG_1.jpg', mime: 'image/jpeg', finished: true });
+        expect(sha256(savedBytes())).toBe(sha256(photo));
+      });
+
+      it('saves several files as one zip', async () => {
+        const ids = [await d.stored(makeJpeg({ color: '#a2' }), 'a.jpg'), await d.stored(original, 'clip.mp4')];
+        await downloadOriginals(e(), ids);
+        expect(saved).toMatchObject({ name: 'Tele-Photo-2-photos.zip', mime: 'application/zip', finished: true });
+        expect(Buffer.from(savedBytes().subarray(0, 4)).toString('latin1')).toBe('PK\x03\x04');
+      });
+
+      it('throws away the half-saved file when Telegram stops answering partway', async () => {
+        const id = await d.stored(original, 'clip.mp4');
+        bigEnough(id);
+        d.storage.failReads = new Error('Connection lost');
+        await expect(downloadOriginals(e(), [id])).rejects.toThrow();
+        d.storage.failReads = null;
+        expect(saved.finished).toBe(false);
+      });
+    });
   });
 });

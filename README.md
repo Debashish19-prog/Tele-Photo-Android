@@ -58,7 +58,7 @@ pnpm android:apk         # android/dist/Tele-Photo.apk
 pnpm android:demo        # android/dist/Tele-Photo-demo.apk, with pretend Telegram, for testing
 ```
 
-If Android Studio is not in `~/Applications/android-studio`, or the SDK is not in `~/Android/Sdk`, set `JAVA_HOME` and `ANDROID_HOME` first.
+The build looks for Android Studio's Java in `~/Applications/android-studio`, `~/android-studio`, `/opt/android-studio` and `~/Android Studio/*/android-studio`, and for the SDK in `~/Android/Sdk`. If yours are elsewhere, set `JAVA_HOME` and `ANDROID_HOME` first.
 
 The first `android:apk` makes a signing key in `android/keystore.jks`, with its password in `android/keystore.properties`. **Keep a copy of both somewhere safe.** Neither is committed. Android only installs an update signed with the same key, so without them you would have to uninstall the app, and sign in again, to update it.
 
@@ -72,15 +72,16 @@ Copy the APK to the phone and open it, allowing the install when Android asks, o
 
 ### How auto backup works
 
-Turn it on from the banner in Photos, or from the account menu under **Auto backup**, and choose **Allow all** when Android asks about photos.
+Turn it on from the banner in Photos, or from the account menu under **Auto backup**, and choose **Allow all** when Android asks about photos and videos.
 
-- **Originals only.** The app reads each file's exact bytes and sends them the same way as any other upload, so nothing is recompressed. Without the extra permission, Android would remove the location from photos before the app sees them. If that permission is missing, the app stops and asks for it, rather than back up a changed copy.
+- **Photos and videos.** Both are backed up as they are. A video over 1.95 GB goes up in pieces, the same as an upload on the website.
+- **Originals only.** The app reads each file's exact bytes and sends them the same way as any other upload, so nothing is recompressed. Without the extra permission, Android would remove the location from photos and videos before the app sees them. If that permission is missing, the app stops and asks for it, rather than back up a changed copy.
 - **It only ever copies.** Removing a photo from the phone does not remove its backup. A photo you trash or delete in the app is not uploaded again. Nothing on the phone is ever changed or deleted.
 - **Wi-Fi only by default.** Originals are large, so mobile data is off unless you turn it on. If Wi-Fi drops partway through a photo, that one photo may finish over mobile data.
 - **In the background.** A new photo wakes the app, which shows a notification while it works and closes again afterwards. Allow **Run in the background** when asked. Without it, Android may stop the backup after about ten minutes each time, and it carries on the next time Android allows it. Some phone makers limit background apps further, and may need the app exempted from battery saving.
 - **It picks up where it left off.** If anything stops it, the next run starts from the first photo not yet stored. Photos already in Telegram are recognised by their hash, so reinstalling the app reads them again but does not upload them again.
 - **Files it cannot store** are counted under **Auto backup**, such as a file that only has the name of a photo.
-- **Videos are not backed up yet.**
+- **Large videos** are copied inside the app while they upload, which takes room on the phone until Telegram has all of it. A file that stops the app every time it is read is set aside and tried again later, so it cannot hold up the rest of the gallery.
 - **Force stop.** Android cancels everything for an app that is force-stopped, and some phones treat swiping an app away the same way. Backups then wait until you next open the app.
 
 ## Can other people use it?

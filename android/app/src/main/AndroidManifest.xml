@@ -5,11 +5,12 @@
     <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
     <uses-permission android:name="android.permission.ACCESS_WIFI_STATE" />
 
-    <!-- Reading the gallery. Android 13 and up ask per media type, and 14 and up can limit it to chosen photos. -->
+    <!-- Reading the gallery. Android 13 and up ask per media type, and 14 and up can limit it to chosen photos and videos. -->
     <uses-permission android:name="android.permission.READ_MEDIA_IMAGES" />
+    <uses-permission android:name="android.permission.READ_MEDIA_VIDEO" />
     <uses-permission android:name="android.permission.READ_MEDIA_VISUAL_USER_SELECTED" />
     <uses-permission android:name="android.permission.READ_EXTERNAL_STORAGE" android:maxSdkVersion="32" />
-    <!-- Without this, Android removes the location from each photo before the app sees it, so it would not be the original. -->
+    <!-- Without this, Android removes the location from each photo and video before the app sees it, so it would not be the original. -->
     <uses-permission android:name="android.permission.ACCESS_MEDIA_LOCATION" />
 
     <!-- Running while the app is closed. -->

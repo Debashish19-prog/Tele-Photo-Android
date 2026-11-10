@@ -73,6 +73,16 @@ export async function downloadOriginals(engine: Engine, ids: number[]): Promise<
   const filename = single ? single.filename : `Tele-Photo-${photos.length}-photos.zip`;
   const total = photos.reduce((sum, p) => sum + p.size, 0);
 
+  // The app saves to Downloads itself. The worker route below must not be tried here: a WebView
+  // drops the download it starts, and that looks the same as one that finished.
+  const bridge = androidBridge();
+  if (bridge) {
+    // A photo open in the viewer already has its original in memory, which is not worth fetching again.
+    const body = !single ? zipOf(engine, photos).body! : total > STREAM_TO_DISK_BYTES ? toStream(await engine.openOriginalStream(single.id)) : (await engine.original(single.id)).stream();
+    await saveThroughApp(bridge, body, filename, single ? single.mime : 'application/zip');
+    return;
+  }
+
   const picker = total > STREAM_TO_DISK_BYTES ? savePicker() : null;
   if (picker) {
     let handle;
@@ -95,7 +105,5 @@ export async function downloadOriginals(engine: Engine, ids: number[]): Promise<
   }
 
   const blob = single ? await engine.original(single.id) : await zipOf(engine, photos).blob();
-  const bridge = androidBridge();
-  if (bridge) await saveThroughApp(bridge, blob, filename);
-  else saveBlob(blob, filename);
+  saveBlob(blob, filename);
 }
